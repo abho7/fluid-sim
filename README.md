@@ -24,7 +24,7 @@ So the report answers, with measurements:
 | How much viscosity did the scheme invent? | **ν_num = 5.79e-4** with MacCormack, 2.9% of the physical ν. With plain semi-Lagrangian it is 2.10e-2 — **105% of ν**, i.e. the simulated fluid is twice as viscous as the one requested. |
 | Where does it go unstable? | Explicit diffusion at **ν·dt/h² = 0.25 stable, 0.26 unstable**. Theory says exactly 0.25, and measured amplification matches \|1 − 8d\| to better than 1e-6 at every point. |
 | What order is it? | **First order in time** — Lie splitting caps it there regardless of the operators, which are individually second order. |
-| Does it reproduce turbulence? | **No.** The enstrophy-range slope is ≈ −6.1 against Kraichnan's −3, and there is no inverse cascade. Documented, diagnosed, not massaged. |
+| Does it reproduce turbulence? | **Partly, and the difference is diagnosable.** The 2D inverse energy cascade measures **-1.525** against Kraichnan's −5/3 (r² = 0.986) — within 9%. The enstrophy cascade is **-4.529** against −3: a very clean power law (r² = 0.999) at the wrong exponent. |
 | Is it really incompressible? | max \|∇·u\| ≈ **1e-13** on the CPU reference; ~1e-6 on the GPU with multigrid. |
 
 ## Method
@@ -118,10 +118,13 @@ code rather than the solver, which is the part worth noting:
 
 ## Known limitations
 
-- **The GPU path implements only semi-Lagrangian advection.** MacCormack exists
-  on the CPU and is ~36× less dissipative. This is the main reason the energy
-  spectrum misses Kraichnan's −3, and it is a gap in the implementation rather
-  than a property of the physics.
+- **The enstrophy range is still too steep** (-4.53 against −3), most likely
+  residual numerical dissipation at the smallest scales, where f32 and a 3-cycle
+  projection bite hardest. This is a measured attribution, not a guess: running
+  the identical study with only the advection scheme changed moved the inverse
+  cascade from +0.99 to -1.52 and the enstrophy slope from −6.08 to -4.53. So
+  dissipation is demonstrably most of it — but not all, and the remainder is not
+  yet explained.
 - **First order in time**, from Lie splitting. Strang splitting would give second
   order for ~1.5× the cost.
 - **f32 on the GPU.** The multigrid residual plateaus near 1e-7 because that is

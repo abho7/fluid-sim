@@ -32,6 +32,14 @@ const num = (v, d = 3) => (v === null || v === undefined || Number.isNaN(v))
 const validation = load("validation");
 const spectrum = load("spectrum-maccormack") ?? load("spectrum");
 const spectrumSL = load("spectrum");   // the semi-Lagrangian run, for comparison
+
+// The collector stores whatever the harness posted. The spectrum page posts
+// `R.result` directly, so its JSON has no `.result` wrapper -- but an earlier
+// manual capture did. Normalising once here avoids the two accessors drifting
+// apart, which is exactly what happened: the summary KPI read `.result.fits`
+// and printed "not measured" while the section below read the same file
+// successfully through a fallback.
+const unwrap = (x) => x ? (x.result ?? x) : null;
 const gpuVerify = load("gpu-verify");
 const bench = load("bench");
 
@@ -249,7 +257,9 @@ function summarySection() {
   const mc = tg?.schemes?.maccormack;
   const sl = tg?.schemes?.["semi-lagrangian"];
   const eb = validation?.stability?.explicitDiffusion?.measuredBoundary;
-  const ens = spectrum?.result?.fits?.enstrophyCascade;
+  const spec = unwrap(spectrum);
+  const ens = spec?.fits?.enstrophyCascade;
+  const invc = spec?.fits?.inverseCascade;
   const gv = gpuVerify;
   const mgRows = bench?.equalQuality?.rows;
   const bigMG = mgRows?.[mgRows.length - 1];
@@ -261,8 +271,12 @@ function summarySection() {
       mc ? `MacCormack, ${(mc.nuNumericalRatio * 100).toFixed(1)}% of the physical ν` : "", "accent")}
     ${kpi(eb ? `${eb.isolated.lastStable} / ${eb.isolated.firstUnstable}` : MISSING,
       "stability boundary", "measured; theory says 0.25", "good")}
-    ${kpi(ens ? num(ens.slope, 2) : MISSING, "enstrophy slope",
-      "theory (Kraichnan) says −3", "bad")}
+    ${kpi(invc ? num(invc.slope, 2) : MISSING, "inverse cascade",
+      "theory (Kraichnan) says −1.67",
+      invc && Math.abs(invc.slope + 5 / 3) < 0.25 ? "good" : "bad")}
+    ${kpi(ens ? num(ens.slope, 2) : MISSING, "enstrophy cascade",
+      "theory (Kraichnan) says −3",
+      ens && Math.abs(ens.slope + 3) < 0.4 ? "good" : "bad")}
     ${kpi(gv ? num(gv.fullStep?.du, 0) : MISSING, "gpu vs cpu",
       "relative L2 after 10 full steps", "good")}
     ${kpi(mc ? num(mc.maxDivergence, 0) : MISSING, "max |∇·u|",
@@ -271,7 +285,7 @@ function summarySection() {
       "gpu speedup", bigMG ? `at ${bigMG.n}², equal solution quality` : "", "accent")}
     ${kpi(sl && mc ? `${(sl.nuNumerical / mc.nuNumerical).toFixed(0)}×` : MISSING,
       "scheme difference", "semi-Lagrangian vs MacCormack dissipation")}
-    ${kpi(validation ? "61" : MISSING, "tests", "node --test, all passing", "good")}
+
   </div>
   <p class="note">
     Every figure on this page was produced by a run and read out of
@@ -567,7 +581,7 @@ function stabilitySection() {
 }
 
 function spectrumSection() {
-  const r = spectrum?.result ?? spectrum;
+  const r = unwrap(spectrum);
   if (!r?.spectrum) {
     return `
 <section><div class="wrap">
@@ -612,10 +626,25 @@ function spectrumSection() {
       `Parseval holds to ${num(r.parseval.relDiff, 0)}, so the normalisation is right.`,
   });
 
+  // Verdicts are computed from the data, not written in advance. The first
+  // version of this section was authored when the only run available used
+  // semi-Lagrangian and missed both laws, and it said so in the heading. When
+  // MacCormack moved the inverse range onto -5/3, a hardcoded heading would
+  // have kept announcing a failure the data no longer showed.
+  const invOff = Math.abs(inv.slope - (-5 / 3));
+  const ensOff = Math.abs(ens.slope - (-3));
+  const invGood = invOff < 0.25 && inv.r2 > 0.85;
+  const ensGood = ensOff < 0.4 && ens.r2 > 0.85;
+  const headline = invGood && ensGood
+    ? "Both cascades match Kraichnan"
+    : invGood
+      ? "The inverse cascade matches. The enstrophy range does not."
+      : "The spectrum does not match Kraichnan, and that is the finding";
+
   return `
 <section><div class="wrap">
-  <p class="eyebrow">turbulence &middot; the honest result</p>
-  <h2>The spectrum does not match Kraichnan, and that is the finding</h2>
+  <p class="eyebrow">turbulence</p>
+  <h2>${headline}</h2>
   <div class="prose stack">
     <p class="lede">
       Kolmogorov's k^(−5/3) describes <em>three-dimensional</em> turbulence. In 2D
@@ -623,48 +652,55 @@ function spectrumSection() {
       phenomenology is different: Kraichnan and Batchelor predict a
       <strong>dual cascade</strong> &mdash; energy travelling upscale from the
       forcing with slope −5/3, and enstrophy travelling downscale with slope −3.
-      Comparing a 2D spectrum to −5/3 across all scales would be comparing against
-      the wrong law for most of it.
+      Comparing a 2D spectrum to −5/3 across all scales would be comparing
+      against the wrong law for most of it, so both ranges are measured
+      separately and each against its own prediction.
     </p>
   </div>
   ${p}
   <div class="cards">
-    <div class="card"><span class="meta">enstrophy range, k ∈ [${ens.kLo}, ${ens.kHi}]</span>
-      <h3 style="color:var(--bad)">${num(ens.slope, 2)} &nbsp;vs theory −3</h3>
-      <p>An extremely clean power law &mdash; r² = ${num(ens.r2, 3)} &mdash; but at
-      roughly twice the predicted steepness. The spectrum is a straight line in
-      log-log; it is simply the wrong line.</p></div>
-    <div class="card"><span class="meta">inverse range, k ∈ [${inv.kLo}, ${inv.kHi}]</span>
-      <h3 style="color:var(--bad)">${num(inv.slope, 2)} &nbsp;vs theory −5/3</h3>
-      <p>Positive, meaning E(k) <em>rises</em> toward the forcing wavenumber. There is
-      no inverse cascade: energy is not reaching large scales at all.</p></div>
-    <div class="card"><span class="meta">why</span>
-      <h3>numerical dissipation</h3>
-      <p>The GPU backend implements semi-Lagrangian advection only, and the
-      Taylor-Green measurement above puts that scheme's invented viscosity at
-      ~100% of the physical value. It removes energy at the forcing scale faster
-      than either cascade can transport it.</p></div>
+    <div class="card"><span class="meta">inverse energy cascade, k ∈ [${inv.kLo}, ${inv.kHi}]</span>
+      <h3 style="color:var(--${invGood ? "good" : "bad"})">${num(inv.slope, 2)} &nbsp;vs theory −1.67</h3>
+      <p>r² = ${num(inv.r2, 3)}${invGood
+        ? `. Within ${(invOff / (5 / 3) * 100).toFixed(0)}% of Kraichnan's prediction &mdash; energy is
+           genuinely being transported upscale from the forcing.`
+        : `. ${inv.slope > 0
+            ? "Positive, meaning E(k) <em>rises</em> toward the forcing wavenumber: no inverse cascade at all."
+            : "Present but well short of the predicted slope."}`}</p></div>
+    <div class="card"><span class="meta">enstrophy cascade, k ∈ [${ens.kLo}, ${ens.kHi}]</span>
+      <h3 style="color:var(--${ensGood ? "good" : "bad"})">${num(ens.slope, 2)} &nbsp;vs theory −3.00</h3>
+      <p>r² = ${num(ens.r2, 3)} &mdash; an extremely clean power law, ${ensGood
+        ? "and the right one."
+        : `but roughly ${(Math.abs(ens.slope) / 3).toFixed(1)}× too steep. The spectrum is a
+           straight line in log-log; it is simply the wrong line.`}</p></div>
+    <div class="card"><span class="meta">the measurement is sound</span>
+      <h3>Parseval ${num(r.parseval.relDiff, 0)}</h3>
+      <p>Σ E(k) matches the kinetic energy computed independently in physical
+      space, so the normalisation is right; and max |∇·u| = ${num(r.maxDivergence, 0)}
+      with multigrid, so the field really is solenoidal. Neither can explain
+      a wrong slope.</p></div>
   </div>
   ${spectrumSL && spectrum !== spectrumSL ? schemeComparison() : ""}
   <div class="finding">
-    <h3>What would be needed to see a real cascade</h3>
+    <h3>What is left over</h3>
     <dl>
-      <dt>diagnosis</dt><dd>The enstrophy slope of ${num(ens.slope, 2)} with
-        r² = ${num(ens.r2, 3)} is not noise. A dissipation range that wide means the
-        scheme is removing energy across the whole resolved band rather than only
-        near the grid scale, which is exactly what a first-order upwind-like method
-        does.</dd>
-      <dt>evidence</dt><dd>The same solver's MacCormack advection is
-        ${validation ? (validation.taylorGreen.schemes["semi-lagrangian"].nuNumerical /
-          validation.taylorGreen.schemes.maccormack.nuNumerical).toFixed(0) : "~36"}×
-        less dissipative on the CPU. The GPU path does not implement it.</dd>
-      <dt>next step</dt><dd>Port MacCormack/BFECC to the GPU kernels and re-run.
-        This is documented as not done rather than presented as a limitation of
-        the physics.</dd>
-      <dt>not the cause</dt><dd>The projection: max |∇·u| =
-        ${num(r.maxDivergence, 0)} with multigrid, so the field really is
-        solenoidal. And Parseval holds to ${num(r.parseval.relDiff, 0)}, so the
-        spectrum's normalisation is correct.</dd>
+      <dt>what matched</dt><dd>${invGood
+        ? `The inverse energy cascade, at ${num(inv.slope, 2)} against −1.67 with
+           r² = ${num(inv.r2, 3)}. Energy really is being carried upscale from the
+           forcing, which is the distinctively two-dimensional half of the theory.`
+        : "Neither range, on this run."}</dd>
+      <dt>what did not</dt><dd>${ensGood ? "Both ranges matched." :
+        `The enstrophy cascade, at ${num(ens.slope, 2)} against −3. The fit is
+         excellent (r² = ${num(ens.r2, 3)}) so this is a real power law at the
+         wrong exponent, not scatter.`}</dd>
+      <dt>most likely cause</dt><dd>Residual numerical dissipation at the small
+        scales. The enstrophy range sits nearest the grid, where any remaining
+        dissipation bites hardest, and this run used f32 with a 3-cycle
+        projection. The scheme comparison above shows the slope moving with the
+        advection scheme, so dissipation is demonstrably part of it.</dd>
+      <dt>ruled out</dt><dd>The projection (max |∇·u| = ${num(r.maxDivergence, 0)}),
+        the spectrum's normalisation (Parseval to ${num(r.parseval.relDiff, 0)}),
+        and the fit window, which was fixed from k_f before any data was seen.</dd>
     </dl>
   </div>
 </div></section>`;
@@ -680,8 +716,8 @@ function spectrumSection() {
  * reported whichever way it came out.
  */
 function schemeComparison() {
-  const a = spectrumSL.result ?? spectrumSL;
-  const b = spectrum.result ?? spectrum;
+  const a = unwrap(spectrumSL);
+  const b = unwrap(spectrum);
   if (!a?.spectrum || !b?.spectrum) return "";
   const ens = b.fits.enstrophyCascade;
 
