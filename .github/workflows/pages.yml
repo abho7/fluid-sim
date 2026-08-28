@@ -1,0 +1,47 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      # No install step: the project has no dependencies. The suite includes the
+      # mutation tests that prove the validators fire, so a green run here means
+      # the published claims are still backed.
+      - run: node --test test/*.test.js
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      # The site is committed, already built from runs on real hardware. CI does
+      # not regenerate it: the benchmark numbers describe a specific GPU, and
+      # re-measuring them on a shared runner with no GPU at all would replace a
+      # real measurement with a meaningless one. CI publishes; it does not measure.
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: .
+      - id: deploy
+        uses: actions/deploy-pages@v4

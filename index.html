@@ -1,0 +1,498 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Incompressible Flow</title>
+<meta name="description" content="A real-time incompressible Navier-Stokes solver running on WebGPU compute shaders, validated against analytic solutions.">
+<style>
+:root{
+  --ink:#eef2f6; --dim:#8d97a4; --line:#1e2530;
+  --panel:rgba(10,13,18,.82); --accent:#69d9ff;
+  --mono:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;
+  --sans:ui-sans-serif,-apple-system,"Segoe UI",Roboto,system-ui,sans-serif;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:#05070a;color:var(--ink);font-family:var(--sans);overflow:hidden}
+canvas{position:fixed;inset:0;width:100vw;height:100vh;display:block;
+  touch-action:none;cursor:crosshair}
+
+.panel{position:fixed;top:1rem;left:1rem;z-index:10;background:var(--panel);
+  backdrop-filter:blur(14px);border:1px solid var(--line);border-radius:12px;
+  padding:1rem 1.1rem;max-width:19rem;font-size:.82rem;line-height:1.55}
+.panel h1{margin:0 0 .1rem;font-size:.95rem;letter-spacing:-.01em}
+.panel .sub{color:var(--dim);font-size:.74rem;margin:0 0 .85rem}
+.row{display:flex;align-items:center;gap:.6rem;margin:.42rem 0}
+.row label{font-family:var(--mono);font-size:.6rem;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--dim);width:5.6rem;flex:none}
+input[type=range]{flex:1;accent-color:var(--accent);height:2px}
+select,button{font-family:var(--mono);font-size:.66rem;background:#141a22;
+  color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:.3rem .5rem}
+button{cursor:pointer}
+button:hover{border-color:var(--accent);color:var(--accent)}
+.stats{margin-top:.8rem;padding-top:.7rem;border-top:1px solid var(--line);
+  font-family:var(--mono);font-size:.66rem;color:var(--dim);
+  display:grid;grid-template-columns:auto auto;gap:.12rem .9rem}
+.stats b{color:var(--ink);font-weight:600;font-variant-numeric:tabular-nums;text-align:right}
+.hint{position:fixed;bottom:1rem;left:50%;transform:translateX(-50%);z-index:10;
+  font-family:var(--mono);font-size:.66rem;color:var(--dim);
+  background:var(--panel);padding:.45rem .9rem;border-radius:999px;
+  border:1px solid var(--line);backdrop-filter:blur(14px);
+  transition:opacity .6s;pointer-events:none}
+.links{position:fixed;top:1rem;right:1rem;z-index:10;display:flex;gap:.5rem}
+.links a{font-family:var(--mono);font-size:.66rem;letter-spacing:.08em;
+  text-transform:uppercase;color:var(--dim);text-decoration:none;
+  background:var(--panel);border:1px solid var(--line);border-radius:999px;
+  padding:.42rem .85rem;backdrop-filter:blur(14px)}
+.links a:hover{color:var(--accent);border-color:var(--accent)}
+#fallback{position:fixed;inset:0;display:none;place-items:center;padding:2rem;
+  text-align:center;z-index:20;background:#05070a}
+#fallback div{max-width:34rem;color:var(--dim);font-size:.9rem;line-height:1.7}
+#fallback code{font-family:var(--mono);color:var(--accent)}
+@media(max-width:40rem){.panel{max-width:calc(100vw - 2rem)}}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div class="panel">
+  <h1>Incompressible flow</h1>
+  <p class="sub">Navier-Stokes on WebGPU compute shaders</p>
+
+  <div class="row">
+    <label for="res">grid</label>
+    <select id="res">
+      <option value="256">256²</option>
+      <option value="512" selected>512²</option>
+      <option value="1024">1024²</option>
+    </select>
+  </div>
+  <div class="row">
+    <label for="mode">colour</label>
+    <select id="mode">
+      <option value="0" selected>vorticity</option>
+      <option value="1">speed</option>
+    </select>
+  </div>
+  <div class="row" title="Vorticity confinement: a non-physical force that pushes energy back into vortices. Off by default — MacCormack advection does not need it, and turning it up amplifies grid-scale noise.">
+    <label for="conf">swirl</label>
+    <input type="range" id="conf" min="0" max="40" step="1" value="0">
+  </div>
+  <div class="row">
+    <label for="iters">pressure</label>
+    <input type="range" id="iters" min="1" max="8" step="1" value="3">
+  </div>
+  <div class="row" style="margin-top:.7rem">
+    <button id="clear">clear</button>
+    <button id="seed">seed vortices</button>
+  </div>
+
+  <div class="stats">
+    <span>solver</span><b id="s-solver">–</b>
+    <span>ms / step</span><b id="s-ms">–</b>
+    <span>fps</span><b id="s-fps">–</b>
+    <span>max |∇·u|</span><b id="s-div">–</b>
+    <span>cells</span><b id="s-cells">–</b>
+  </div>
+</div>
+
+<div class="links">
+  <a href="report.html">validation report</a>
+  <a href="https://github.com/abho7/fluid-sim">source</a>
+</div>
+
+<div class="hint" id="hint">drag to push the fluid</div>
+
+<div id="fallback"><div>
+  <p><strong>This demo needs WebGPU.</strong></p>
+  <p>Chrome or Edge 113+ on desktop will run it. Firefox and Safari are still
+  shipping support.</p>
+  <p>The physics is real either way &mdash; the
+  <a href="report.html" style="color:var(--accent)">validation report</a> shows the
+  solver measured against closed-form solutions, and every number there was
+  produced by a run rather than typed in.</p>
+</div></div>
+
+<script type="module">
+/**
+ * The interactive demo.
+ *
+ * WHAT MAKES IT LOOK THE WAY IT DOES. Nothing here is a visual effect layered
+ * on top of the simulation. The colour is a direct map of vorticity, which is a
+ * field the solver computes because the physics needs it; the filaments and
+ * spiral roll-ups are what an incompressible flow does when you push it. The
+ * one deliberately non-physical control is "swirl" (vorticity confinement),
+ * which is labelled as such and is OFF in every measurement on the report --
+ * see the report's limitations section for why that separation matters.
+ */
+import { createDevice, GPUFluidSolver } from "./src/gpu/solver.js";
+
+const canvas = document.getElementById("c");
+const $ = id => document.getElementById(id);
+
+let device, gpu, ctx, format;
+let running = true;
+let res = 512;
+let colourMode = 0;
+
+const pointer = { down: false, x: 0, y: 0, px: 0, py: 0, hue: Math.random() };
+const splats = [];
+
+// ------------------------------------------------------------------ palette
+//
+// Dye colour cycles slowly through hue so successive strokes stay
+// distinguishable without any two being jarring together. Kept low-saturation
+// so the dye reads as a tracer in the flow rather than as paint on top of it.
+function hueToRGB(h) {
+  const f = (n) => {
+    const k = (n + h * 6) % 6;
+    return 0.55 * Math.max(0, Math.min(1, Math.min(k, 4 - k, 1))) + 0.06;
+  };
+  return [f(5), f(3), f(1)];
+}
+
+async function init() {
+  try {
+    const d = await createDevice();
+    device = d.device;
+    $("s-solver").textContent = `${d.info?.vendor ?? "gpu"} · multigrid`;
+  } catch (e) {
+    document.getElementById("fallback").style.display = "grid";
+    return;
+  }
+
+  ctx = canvas.getContext("webgpu");
+  format = navigator.gpu.getPreferredCanvasFormat();
+  ctx.configure({ device, format, alphaMode: "opaque" });
+
+  build(res);
+  resize();
+  addEventListener("resize", resize);
+  wire();
+
+  // Exposed for verification. requestAnimationFrame does not fire in a headless
+  // or automated tab, so without a handle on the solver there is no way to
+  // confirm from outside that the physics actually advances -- only that the
+  // first frame drew. `window.__sim.advance(n)` steps and renders n times.
+  window.__sim = {
+    get gpu() { return gpu; },
+    advance(n = 1) {
+      for (let i = 0; i < n; i++) {
+        gpu.step(1 / 90, { splats: splats.splice(0, splats.length) });
+      }
+      gpu.render({ mode: colourMode, scale: colourMode === 0 ? vortScale : 1.4 });
+      blit();
+      return gpu.steps;
+    },
+    push(x, y, dx, dy) {
+      splats.push({ x, y, dx, dy, radius: 0.15, isDye: false });
+      const [r, g, b] = hueToRGB(Math.random());
+      splats.push({ x, y, r: r * 0.5, g: g * 0.5, b: b * 0.5, radius: 0.11, isDye: true });
+    },
+    seed: seedVortices,
+    recalibrate,
+  };
+
+  requestAnimationFrame(frame);
+}
+
+function build(n) {
+  gpu?.destroy();
+  res = n;
+  gpu = new GPUFluidSolver(device, {
+    n,
+    nu: 0,
+    confinement: Number($("conf").value),
+    dyeFade: 0.0022,          // slow fade so strokes clear without visibly wiping
+    pressureSolver: "multigrid",
+    pressureIterations: Number($("iters").value),
+  });
+  $("s-cells").textContent = (n * n).toLocaleString();
+  buildBlit();
+}
+
+// ------------------------------------------------------------------- blit
+//
+// The compute pass writes an rgba8unorm storage texture; this draws it to the
+// swap chain. A full-screen triangle rather than a quad: one primitive, no
+// seam down the diagonal, and no vertex buffer.
+let blitPipeline, blitSampler;
+function buildBlit() {
+  const module = device.createShaderModule({ code: /* wgsl */`
+    @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+      var p = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -3.0), vec2<f32>(-1.0, 1.0), vec2<f32>(3.0, 1.0));
+      return vec4<f32>(p[i], 0.0, 1.0);
+    }
+    @group(0) @binding(0) var t : texture_2d<f32>;
+    @group(0) @binding(1) var s : sampler;
+    @fragment fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+      let uv = pos.xy / vec2<f32>(f32(RES_W), f32(RES_H));
+      return textureSample(t, s, uv);
+    }
+  `.replace("RES_W", canvas.width || 1).replace("RES_H", canvas.height || 1) });
+
+  blitPipeline = device.createRenderPipeline({
+    layout: "auto",
+    vertex: { module, entryPoint: "vs" },
+    fragment: { module, entryPoint: "fs", targets: [{ format }] },
+    primitive: { topology: "triangle-list" },
+  });
+  blitSampler = device.createSampler({ magFilter: "linear", minFilter: "linear" });
+}
+
+/** Draw the solver's output texture to the swap chain. */
+function blit() {
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginRenderPass({
+    colorAttachments: [{
+      view: ctx.getCurrentTexture().createView(),
+      loadOp: "clear", storeOp: "store",
+      clearValue: { r: 0.02, g: 0.027, b: 0.04, a: 1 },
+    }],
+  });
+  pass.setPipeline(blitPipeline);
+  pass.setBindGroup(0, device.createBindGroup({
+    layout: blitPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: gpu.output.createView() },
+      { binding: 1, resource: blitSampler },
+    ],
+  }));
+  pass.draw(3);
+  pass.end();
+  device.queue.submit([enc.finish()]);
+}
+
+function resize() {
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  canvas.width = Math.floor(innerWidth * dpr);
+  canvas.height = Math.floor(innerHeight * dpr);
+  buildBlit();
+}
+
+// -------------------------------------------------------------- interaction
+
+function toSim(clientX, clientY) {
+  // Screen -> simulation coordinates. The domain is [0, 2π)² and the canvas is
+  // an arbitrary aspect ratio, so the shorter axis is filled and the longer one
+  // is scaled to match -- otherwise dragging near an edge would inject force at
+  // a position the fluid does not have.
+  const r = canvas.getBoundingClientRect();
+  const fx = (clientX - r.left) / r.width;
+  const fy = 1 - (clientY - r.top) / r.height;
+  return [fx * 2 * Math.PI, fy * 2 * Math.PI];
+}
+
+function wire() {
+  const hint = $("hint");
+  let hintShown = true;
+
+  const down = (e) => {
+    pointer.down = true;
+    const [x, y] = toSim(e.clientX ?? e.touches[0].clientX,
+                         e.clientY ?? e.touches[0].clientY);
+    pointer.x = pointer.px = x;
+    pointer.y = pointer.py = y;
+    pointer.hue = (pointer.hue + 0.13) % 1;
+    if (hintShown) { hint.style.opacity = "0"; hintShown = false; }
+  };
+  const move = (e) => {
+    if (!pointer.down) return;
+    e.preventDefault?.();
+    const [x, y] = toSim(e.clientX ?? e.touches[0].clientX,
+                         e.clientY ?? e.touches[0].clientY);
+    pointer.px = pointer.x; pointer.py = pointer.y;
+    pointer.x = x; pointer.y = y;
+
+    // Force proportional to pointer velocity, so a flick shoves and a slow drag
+    // nudges -- the fluid responds to how you move, not merely where.
+    let dx = x - pointer.px, dy = y - pointer.py;
+    // Shortest path on the periodic domain, so dragging across the seam does
+    // not inject a domain-sized impulse.
+    const L = 2 * Math.PI;
+    dx -= L * Math.round(dx / L);
+    dy -= L * Math.round(dy / L);
+    const strength = 340;
+    const [r, g, b] = hueToRGB(pointer.hue);
+
+    splats.push({ x, y, dx: dx * strength, dy: dy * strength,
+                  radius: 0.13, isDye: false });
+    splats.push({ x, y, r: r * 0.5, g: g * 0.5, b: b * 0.5,
+                  radius: 0.10, isDye: true });
+  };
+  const up = () => { pointer.down = false; };
+
+  canvas.addEventListener("pointerdown", down);
+  addEventListener("pointermove", move, { passive: false });
+  addEventListener("pointerup", up);
+  canvas.addEventListener("touchstart", down, { passive: false });
+  addEventListener("touchmove", move, { passive: false });
+  addEventListener("touchend", up);
+
+  $("res").onchange = e => build(Number(e.target.value));
+  $("mode").onchange = e => { colourMode = Number(e.target.value); };
+  $("conf").oninput = e => { gpu.confinement = Number(e.target.value); };
+  $("iters").oninput = e => { gpu.pressureIterations = Number(e.target.value); };
+  $("clear").onclick = () => {
+    const zero = new Float32Array(res * res * 4);
+    gpu.uploadVelocity(new Float32Array(res * res), new Float32Array(res * res));
+    gpu.uploadDye(zero);
+  };
+  $("seed").onclick = seedVortices;
+
+  addEventListener("keydown", e => {
+    if (e.key === " ") { running = !running; e.preventDefault(); }
+  });
+}
+
+/**
+ * Seed a row of counter-rotating vortex pairs.
+ *
+ * Not decoration: counter-rotating pairs are the canonical way to get a 2D flow
+ * to go unstable and produce the filamented structure the colour map exists to
+ * show. It also gives a first-time visitor something moving without needing to
+ * discover the drag interaction.
+ */
+function seedVortices() {
+  const n = res, u = new Float32Array(n * n), v = new Float32Array(n * n);
+  const dx = 2 * Math.PI / n;
+  // Two staggered rows of tight counter-rotating vortices. The first version
+  // used six wide ones (width 0.35 on a 2π domain), which produced a smooth
+  // gradient wash rather than visible structure -- the vortices were larger than
+  // the features they were supposed to create. Tighter cores leave room for the
+  // shear layers between them to roll up, which is what actually looks like
+  // fluid.
+  const centres = [];
+  const COLS = 7;
+  for (let i = 0; i < COLS; i++) {
+    for (const [dy, sgn] of [[-0.85, 1], [0.85, -1]]) {
+      centres.push({
+        x: (i + 0.5) * 2 * Math.PI / COLS,
+        y: Math.PI + dy + 0.22 * Math.sin(i * 2.1),
+        s: sgn * (i % 2 === 0 ? 1 : -1),
+      });
+    }
+  }
+  for (let j = 0; j < n; j++) {
+    for (let i = 0; i < n; i++) {
+      let su = 0, sv = 0;
+      const xu = i * dx, yu = (j + 0.5) * dx;
+      const xv = (i + 0.5) * dx, yv = j * dx;
+      for (const c of centres) {
+        // Lamb-Oseen-like: a Gaussian vortex, whose velocity field is the curl
+        // of a Gaussian streamfunction. Smooth, so it does not immediately
+        // alias on the grid.
+        const r2u = wrapd(xu - c.x) ** 2 + wrapd(yu - c.y) ** 2;
+        const r2v = wrapd(xv - c.x) ** 2 + wrapd(yv - c.y) ** 2;
+        su += c.s * -wrapd(yu - c.y) * Math.exp(-r2u / 0.09);
+        sv += c.s * wrapd(xv - c.x) * Math.exp(-r2v / 0.09);
+      }
+      u[j * n + i] = su * 3.2;
+      v[j * n + i] = sv * 3.2;
+    }
+  }
+  gpu.uploadVelocity(u, v);
+
+  const dye = new Float32Array(n * n * 4);
+  for (let j = 0; j < n; j++) {
+    for (let i = 0; i < n; i++) {
+      const k = (j * n + i) * 4;
+      const [r, g, b] = hueToRGB(i / n);
+      // Narrow stripes rather than one broad band: thin tracer lines get
+      // stretched into filaments by the flow, which is the structure worth
+      // seeing. A wide band just smears into a wash.
+      const band = Math.exp(-((((j / n) * 9) % 1 - 0.5) ** 2) / 0.006);
+      dye[k] = r * band * 0.42; dye[k + 1] = g * band * 0.42; dye[k + 2] = b * band * 0.42;
+    }
+  }
+  gpu.uploadDye(dye);
+}
+
+function wrapd(d) {
+  const L = 2 * Math.PI;
+  return d - L * Math.round(d / L);
+}
+
+// -------------------------------------------------------------- frame loop
+
+let last = performance.now(), frames = 0, fpsAcc = 0, msAcc = 0;
+let divCounter = 0;
+
+/**
+ * Auto-exposure for the vorticity colour map.
+ *
+ * The map is tanh(ω · scale), and tanh saturates above an argument of about 2.
+ * With a fixed scale the picture depends entirely on how hard the user has been
+ * pushing: measured RMS vorticity after seeding was 4.6, so a scale of 0.55 put
+ * the TYPICAL cell at tanh(2.5) = 0.99 -- every pixel pinned to full warm or
+ * full cool, with grid-scale fluctuation flipping between them. That is what
+ * produced the speckle; the structure was there underneath it, fully saturated.
+ *
+ * Calibrating to the field's own RMS keeps the bulk of the flow in tanh's linear
+ * range and lets only the genuine vortex cores saturate, which is the contrast
+ * the eye actually reads as structure. Sampled every ~1.5 s and eased, so it
+ * cannot visibly pump.
+ */
+let vortScale = 0.55;
+async function recalibrate() {
+  const vel = await gpu.readVelocity();
+  const n = gpu.nx, dx = gpu.dx;
+  let sum2 = 0;
+  // A coarse stride: this is an exposure estimate, not a measurement, and
+  // sampling every 4th cell is 16x cheaper for the same answer.
+  for (let j = 0; j < n; j += 4) {
+    for (let i = 0; i < n; i += 4) {
+      const im = (i - 1 + n) % n, jm = (j - 1 + n) % n;
+      const w = (vel.v[j * n + i] - vel.v[j * n + im]) / dx
+              - (vel.u[j * n + i] - vel.u[jm * n + i]) / dx;
+      sum2 += w * w;
+    }
+  }
+  const rms = Math.sqrt(sum2 / ((n / 4) * (n / 4)));
+  if (rms > 1e-6) {
+    // Target tanh argument ~0.45 at RMS: linear for the bulk, saturating only
+    // for cores several times stronger than typical.
+    const target = 0.45 / rms;
+    vortScale += (target - vortScale) * 0.35;   // eased, so exposure never pumps
+  }
+}
+
+async function frame(now) {
+  const dtReal = Math.min((now - last) / 1000, 0.05);
+  last = now;
+
+  if (running) {
+    const t0 = performance.now();
+    // Fixed simulation timestep, independent of frame rate. Feeding the real
+    // frame delta into the solver makes the physics change when the frame rate
+    // does, which is both wrong and visibly unstable when a frame is dropped.
+    gpu.step(1 / 90, { splats: splats.splice(0, splats.length) });
+    msAcc += performance.now() - t0;
+  }
+
+  gpu.render({ mode: colourMode, scale: colourMode === 0 ? vortScale : 1.4 });
+  blit();
+
+  // stats
+  frames++; fpsAcc += dtReal;
+  if (fpsAcc > 0.5) {
+    $("s-fps").textContent = (frames / fpsAcc).toFixed(0);
+    $("s-ms").textContent = (msAcc / frames).toFixed(1);
+    frames = 0; fpsAcc = 0; msAcc = 0;
+  }
+  // Divergence needs a readback, so it is sampled rarely -- measuring it every
+  // frame would stall the pipeline and change the very frame time shown above.
+  if (++divCounter % 180 === 0) {
+    gpu.maxDivergence().then(d => { $("s-div").textContent = d.toExponential(1); });
+  }
+  if (divCounter % 90 === 45) recalibrate();
+
+  requestAnimationFrame(frame);
+}
+
+init();
+</script>
+</body>
+</html>

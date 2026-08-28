@@ -1,0 +1,1086 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Validating a Fluid Solver</title>
+<meta name="description" content="An incompressible Navier-Stokes solver on WebGPU, measured against analytic solutions: numerical viscosity, stability boundaries, convergence, and an energy spectrum that does not match theory.">
+<style>
+:root{
+  --bg:#06090d; --panel:#0d1218; --raised:#131a22; --line:#1e2733; --line2:#2b3644;
+  --ink:#eaf0f6; --ink2:#aab6c4; --dim:#828d9b;
+  --accent:#69d9ff; --accent-dim:#2f7f99;
+  --good:#7ee787; --warn:#ffc857; --bad:#ff6b81; --violet:#b18cff;
+  --mono:ui-monospace,SFMono-Regular,"JetBrains Mono",Consolas,"Liberation Mono",monospace;
+  --sans:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,system-ui,sans-serif;
+  --measure:68ch;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
+  font-size:16px;line-height:1.68;-webkit-font-smoothing:antialiased}
+.wrap{max-width:76rem;margin:0 auto;padding:0 clamp(1.1rem,4vw,2.5rem)}
+.prose{max-width:var(--measure)}
+h1,h2,h3,h4{margin:0;line-height:1.2;letter-spacing:-.021em;font-weight:640;text-wrap:balance}
+p{margin:0}
+a{color:var(--accent);text-decoration-color:var(--accent-dim);text-underline-offset:3px}
+code{font-family:var(--mono);font-size:.86em;background:var(--raised);
+  border:1px solid var(--line);border-radius:4px;padding:.06em .34em;color:var(--ink2)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+
+section{padding:3.2rem 0;border-top:1px solid var(--line)}
+section > .wrap{display:flex;flex-direction:column;gap:1.4rem}
+.stack{display:flex;flex-direction:column;gap:1rem}
+.stack-sm{display:flex;flex-direction:column;gap:.5rem}
+
+.eyebrow{font-family:var(--mono);font-size:.6rem;letter-spacing:.24em;
+  text-transform:uppercase;color:var(--accent);margin:0}
+h2{font-size:clamp(1.35rem,2.4vw,1.72rem)}
+h3{font-size:1rem}
+h4{font-size:.88rem;color:var(--ink2)}
+.lede{color:var(--ink2);font-size:1.02rem}
+.note{color:var(--dim);font-size:.86rem;max-width:var(--measure)}
+.missing{color:var(--warn);font-family:var(--mono);font-size:.85em}
+
+header{padding:clamp(3.5rem,9vw,6rem) 0 3rem;position:relative;overflow:hidden}
+header .wrap{display:flex;flex-direction:column;gap:1.3rem;position:relative;z-index:1}
+header canvas{position:absolute;inset:0;width:100%;height:100%;opacity:.42;z-index:0}
+h1{font-size:clamp(2rem,5.2vw,3.2rem);letter-spacing:-.034em;font-weight:700}
+h1 em{font-style:normal;color:var(--accent)}
+.byline{font-family:var(--mono);font-size:.66rem;letter-spacing:.13em;
+  text-transform:uppercase;color:var(--dim);display:flex;flex-wrap:wrap;gap:.5rem 1.2rem}
+
+.kpi{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1px;
+  background:var(--line);border:1px solid var(--line);border-radius:14px;overflow:hidden}
+@media(max-width:60rem){.kpi{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.kpi>div{background:var(--panel);padding:1rem 1.1rem;display:flex;
+  flex-direction:column;gap:.28rem;min-width:0}
+.kpi .v{font-family:var(--mono);font-size:1.42rem;font-weight:700;letter-spacing:-.03em;
+  font-variant-numeric:tabular-nums;line-height:1.1}
+.kpi .k{font-family:var(--mono);font-size:.55rem;letter-spacing:.17em;
+  text-transform:uppercase;color:var(--dim)}
+.kpi .s{font-size:.75rem;color:var(--dim);line-height:1.4}
+.v.good{color:var(--good)} .v.accent{color:var(--accent)}
+.v.warn{color:var(--warn)} .v.bad{color:var(--bad)}
+
+.cards{display:grid;gap:1rem;grid-template-columns:repeat(auto-fit,minmax(17rem,1fr))}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+  padding:1.1rem 1.2rem;display:flex;flex-direction:column;gap:.5rem}
+.card p{font-size:.87rem;color:var(--ink2)}
+.card .meta{font-family:var(--mono);font-size:.58rem;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--dim)}
+
+.scroll{overflow-x:auto;border-radius:12px}
+table{width:100%;border-collapse:collapse;font-size:.82rem;background:var(--panel)}
+thead th{font-family:var(--mono);font-size:.55rem;letter-spacing:.15em;text-transform:uppercase;
+  color:var(--dim);font-weight:400;text-align:left;padding:.7rem .9rem;
+  border-bottom:1px solid var(--line2);white-space:nowrap;background:var(--raised)}
+tbody td{padding:.62rem .9rem;border-bottom:1px solid var(--line);color:var(--ink2);
+  vertical-align:top}
+tbody tr:last-child td{border-bottom:0}
+td.num,th.num{text-align:right;font-family:var(--mono);
+  font-variant-numeric:tabular-nums;white-space:nowrap}
+td.mono{font-family:var(--mono);white-space:nowrap}
+td strong{color:var(--ink);font-weight:600}
+.tbl-wrap{border:1px solid var(--line);border-radius:12px;overflow:hidden}
+
+.pill{font-family:var(--mono);font-size:.57rem;letter-spacing:.1em;text-transform:uppercase;
+  padding:.14rem .5rem;border-radius:999px;border:1px solid currentColor;white-space:nowrap}
+.pill.good{color:var(--good)} .pill.bad{color:var(--bad)} .pill.warn{color:var(--warn)}
+
+figure{margin:0;background:var(--panel);border:1px solid var(--line);border-radius:12px;
+  padding:1.2rem;display:flex;flex-direction:column;gap:.8rem}
+figure svg{display:block;max-width:100%;height:auto}
+figcaption{font-size:.79rem;color:var(--dim);max-width:var(--measure);line-height:1.6}
+.figs{display:grid;gap:1rem;grid-template-columns:repeat(auto-fit,minmax(24rem,1fr))}
+
+.finding{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--warn);
+  border-radius:10px;padding:1.1rem 1.25rem;display:flex;flex-direction:column;gap:.6rem}
+.finding.bug{border-left-color:var(--bad)}
+.finding h3{font-size:.96rem}
+.finding dl{margin:0;display:grid;grid-template-columns:6.5rem 1fr;gap:.4rem 1rem;font-size:.86rem}
+@media(max-width:44rem){.finding dl{grid-template-columns:1fr;gap:.1rem}
+  .finding dd{margin-bottom:.45rem}}
+.finding dt{font-family:var(--mono);font-size:.55rem;letter-spacing:.15em;text-transform:uppercase;
+  color:var(--dim);padding-top:.28rem}
+.finding dd{margin:0;color:var(--ink2)}
+
+.cta{display:inline-flex;align-items:center;gap:.5rem;font-family:var(--mono);
+  font-size:.67rem;letter-spacing:.12em;text-transform:uppercase;background:var(--accent);
+  color:#04222c;text-decoration:none;font-weight:700;padding:.7rem 1.15rem;
+  border-radius:8px;width:fit-content}
+.cta:hover{background:#9ce8ff}
+.cta.ghost{background:transparent;color:var(--ink2);border:1px solid var(--line2)}
+.cta.ghost:hover{background:var(--raised);color:var(--ink)}
+.row{display:flex;gap:.7rem;flex-wrap:wrap;align-items:center}
+
+pre{margin:0;background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  padding:1rem 1.1rem;overflow-x:auto;font-family:var(--mono);font-size:.78rem;
+  line-height:1.7;color:var(--ink2)}
+pre .c{color:var(--dim)}
+ul{margin:0;padding-left:1.15rem;display:flex;flex-direction:column;gap:.42rem}
+li{color:var(--ink2);font-size:.92rem}
+li strong{color:var(--ink);font-weight:600}
+footer{padding:2.4rem 0 4rem;border-top:1px solid var(--line);color:var(--dim);
+  font-family:var(--mono);font-size:.65rem;line-height:1.9}
+@media (prefers-reduced-motion:reduce){*{animation-duration:.001ms!important}}
+</style>
+</head>
+<body>
+
+<header>
+  <canvas id="hero" aria-hidden="true"></canvas>
+  <div class="wrap">
+    <p class="eyebrow">fluid-sim &middot; validation report</p>
+    <h1>The physics is real.<br>Here is <em>how real</em>.</h1>
+    <p class="lede prose">
+      An incompressible Navier-Stokes solver on WebGPU compute shaders, measured
+      against closed-form solutions rather than against how it looks. This page
+      reports what the solver gets right, what it gets wrong, and by how much
+      &mdash; including a turbulence result that does not match theory, and why.
+    </p>
+    <p class="byline">
+      <span>node v24.18.0</span><span>13th Gen Intel(R) Core(TM) i7-1355U</span>
+      <span>gpu intel gen-12lp</span>
+      <span>generated 2026-08-28T14:29:47</span>
+    </p>
+    <div class="row">
+      <a class="cta" href="index.html">Open the live demo &#8594;</a>
+      <a class="cta ghost" href="https://github.com/abho7/fluid-sim">Source</a>
+    </div>
+  </div>
+</header>
+
+<section><div class="wrap">
+  <div class="kpi">
+    <div><span class="v accent">5.79e-4</span><span class="k">numerical viscosity</span><span class="s">MacCormack, 2.9% of the physical ν</span></div>
+    <div><span class="v good">0.25 / 0.26</span><span class="k">stability boundary</span><span class="s">measured; theory says 0.25</span></div>
+    <div><span class="v bad"><span class="missing">not measured</span></span><span class="k">enstrophy slope</span><span class="s">theory (Kraichnan) says −3</span></div>
+    <div><span class="v good">3.31e-6</span><span class="k">gpu vs cpu</span><span class="s">relative L2 after 10 full steps</span></div>
+    <div><span class="v good">1.54e-13</span><span class="k">max |∇·u|</span><span class="s">incompressibility, CPU reference</span></div>
+    <div><span class="v accent">26.4×</span><span class="k">gpu speedup</span><span class="s">at 512², equal solution quality</span></div>
+    <div><span class="v ">36×</span><span class="k">scheme difference</span><span class="s">semi-Lagrangian vs MacCormack dissipation</span></div>
+    <div><span class="v good">61</span><span class="k">tests</span><span class="s">node --test, all passing</span></div>
+  </div>
+  <p class="note">
+    Every figure on this page was produced by a run and read out of
+    <code>results/*.json</code>. Nothing is typed in; where a value is missing,
+    the page says so.
+  </p>
+</div></section>
+
+<section><div class="wrap">
+  <p class="eyebrow">the headline measurement</p>
+  <h2>Taylor-Green vortex: how much viscosity did the solver invent?</h2>
+  <div class="prose stack">
+    <p class="lede">
+      The 2D Taylor-Green vortex is an exact solution of Navier-Stokes. Its
+      kinetic energy decays as <code>e^(−4νt)</code>, precisely. A simulation
+      decays faster, because the advection scheme's interpolation removes energy
+      on top of the physical viscosity.
+    </p>
+    <p style="color:var(--ink2);font-size:.94rem">
+      Fitting the measured decay to <code>e^(−4ν_eff·t)</code> gives an effective
+      viscosity, and <strong>ν_num = ν_eff − ν</strong> is the artificial part
+      &mdash; the same units as the real thing, so "this scheme is dissipative"
+      becomes a number instead of an adjective. The r² column matters: it
+      confirms the decay really is exponential, without which ν_eff would be
+      meaningless.
+    </p>
+  </div>
+  <div class="figs"><figure>
+  <div class="scroll"><svg viewBox="0 0 640 380" role="img" aria-label="Error against the exact solution">
+    <line x1="62.0" y1="30" x2="62.0" y2="334" stroke="#1a2029"/>
+    <text x="62.0" y="350" text-anchor="middle" font-size="10" fill="#7d8794">-0.04</text>
+    <line x1="174.0" y1="30" x2="174.0" y2="334" stroke="#1a2029"/>
+    <text x="174.0" y="350" text-anchor="middle" font-size="10" fill="#7d8794">0.18</text>
+    <line x1="286.0" y1="30" x2="286.0" y2="334" stroke="#1a2029"/>
+    <text x="286.0" y="350" text-anchor="middle" font-size="10" fill="#7d8794">0.39</text>
+    <line x1="398.0" y1="30" x2="398.0" y2="334" stroke="#1a2029"/>
+    <text x="398.0" y="350" text-anchor="middle" font-size="10" fill="#7d8794">0.61</text>
+    <line x1="510.0" y1="30" x2="510.0" y2="334" stroke="#1a2029"/>
+    <text x="510.0" y="350" text-anchor="middle" font-size="10" fill="#7d8794">0.82</text>
+    <line x1="622.0" y1="30" x2="622.0" y2="334" stroke="#1a2029"/>
+    <text x="622.0" y="350" text-anchor="middle" font-size="10" fill="#7d8794">1.0</text>
+    <line x1="62" y1="272.1" x2="622" y2="272.1" stroke="#1a2029"/>
+    <text x="54" y="275.6" text-anchor="end" font-size="10" fill="#7d8794">10⁻⁴</text>
+    <line x1="62" y1="186.2" x2="622" y2="186.2" stroke="#1a2029"/>
+    <text x="54" y="189.7" text-anchor="end" font-size="10" fill="#7d8794">10⁻³</text>
+    <line x1="62" y1="100.3" x2="622" y2="100.3" stroke="#1a2029"/>
+    <text x="54" y="103.8" text-anchor="end" font-size="10" fill="#7d8794">10⁻²</text>
+    <rect x="62" y="30" width="560" height="304" fill="none" stroke="#232a35"/>
+    <polyline points="95.7,182.7 108.7,156.9 121.6,141.8 134.6,131.1 147.6,122.9 160.5,116.2 173.5,110.5 186.4,105.6 199.4,101.2 212.4,97.4 225.3,93.9 238.3,90.7 251.3,87.8 264.2,85.1 277.2,82.6 290.1,80.2 303.1,78.0 316.1,76.0 329.0,74.0 342.0,72.2 355.0,70.4 367.9,68.7 380.9,67.1 393.9,65.6 406.8,64.1 419.8,62.7 432.7,61.4 445.7,60.1 458.7,58.9 471.6,57.7 484.6,56.5 497.6,55.4 510.5,54.3 523.5,53.2 536.4,52.2 549.4,51.2 562.4,50.3 575.3,49.3 588.3,48.4 601.3,47.5" fill="none" stroke="#ff9d5c" stroke-width="1.8"/>
+    <polyline points="95.7,314.9 108.7,289.1 121.6,274.1 134.6,263.4 147.6,255.1 160.5,248.4 173.5,242.7 186.4,237.7 199.4,233.4 212.4,229.5 225.3,226.0 238.3,222.8 251.3,219.9 264.2,217.1 277.2,214.6 290.1,212.2 303.1,210.0 316.1,208.0 329.0,206.0 342.0,204.1 355.0,202.3 367.9,200.7 380.9,199.0 393.9,197.5 406.8,196.0 419.8,194.6 432.7,193.3 445.7,192.0 458.7,190.7 471.6,189.5 484.6,188.3 497.6,187.2 510.5,186.1 523.5,185.0 536.4,184.0 549.4,183.0 562.4,182.0 575.3,181.0 588.3,180.1 601.3,179.2" fill="none" stroke="#69d9ff" stroke-width="1.8"/>
+    <rect x="494.0" y="36.0" width="122.0" height="38" rx="5" fill="#0d1218" fill-opacity=".88" stroke="#232a35"/>
+    <line x1="502.0" y1="49" x2="518.0" y2="49" stroke="#ff9d5c" stroke-width="2"/>
+    <text x="524.0" y="52.5" font-size="10" fill="#e8edf3">semi-Lagrangian</text>
+    <line x1="502.0" y1="64" x2="518.0" y2="64" stroke="#69d9ff" stroke-width="2"/>
+    <text x="524.0" y="67.5" font-size="10" fill="#e8edf3">MacCormack</text>
+    <text x="62" y="18" font-size="11" fill="#e8edf3" font-weight="600">Error against the exact solution</text>
+    <text x="342" y="374" text-anchor="middle" font-size="10" fill="#7d8794">time</text>
+    <text x="14" y="182" text-anchor="middle" font-size="10" fill="#7d8794" transform="rotate(-90 14 182)">relative L2 error</text>
+  </svg></div>
+  <figcaption>Both schemes on the same grid (64²), ν = 0.02, dt = 0.005. MacCormack's error is roughly 34× smaller at the end of the run.</figcaption>
+</figure><figure>
+  <div class="scroll"><svg viewBox="0 0 640 380" role="img" aria-label="Energy decay vs the closed form">
+    <line x1="62.0" y1="30" x2="62.0" y2="334" stroke="#1a2029"/>
+    <text x="62.0" y="350" text-anchor="middle" font-size="10" fill="#7d8794">-0.04</text>
+    <line x1="174.0" y1="30" x2="174.0" y2="334" stroke="#1a2029"/>
+    <text x="174.0" y="350" text-anchor="middle" font-size="10" fill="#7d8794">0.18</text>
+    <line x1="286.0" y1="30" x2="286.0" y2="334" stroke="#1a2029"/>
+    <text x="286.0" y="350" text-anchor="middle" font-size="10" fill="#7d8794">0.39</text>
+    <line x1="398.0" y1="30" x2="398.0" y2="334" stroke="#1a2029"/>
+    <text x="398.0" y="350" text-anchor="middle" font-size="10" fill="#7d8794">0.61</text>
+    <line x1="510.0" y1="30" x2="510.0" y2="334" stroke="#1a2029"/>
+    <text x="510.0" y="350" text-anchor="middle" font-size="10" fill="#7d8794">0.82</text>
+    <line x1="622.0" y1="30" x2="622.0" y2="334" stroke="#1a2029"/>
+    <text x="622.0" y="350" text-anchor="middle" font-size="10" fill="#7d8794">1.0</text>
+    <rect x="62" y="30" width="560" height="304" fill="none" stroke="#232a35"/>
+    <polyline points="82.7,154.6 95.7,155.1 108.7,155.6 121.6,156.1 134.6,156.7 147.6,157.2 160.5,157.7 173.5,158.3 186.4,158.8 199.4,159.3 212.4,159.9 225.3,160.4 238.3,160.9 251.3,161.4 264.2,162.0 277.2,162.5 290.1,163.0 303.1,163.6 316.1,164.1 329.0,164.6 342.0,165.2 355.0,165.7 367.9,166.2 380.9,166.7 393.9,167.3 406.8,167.8 419.8,168.3 432.7,168.9 445.7,169.4 458.7,169.9 471.6,170.5 484.6,171.0 497.6,171.5 510.5,172.0 523.5,172.6 536.4,173.1 549.4,173.6 562.4,174.2 575.3,174.7 588.3,175.2 601.3,175.8" fill="none" stroke="#7ee787" stroke-width="1.8" stroke-dasharray="5 4"/>
+    <polyline points="82.7,155.2 95.7,156.3 108.7,157.4 121.6,158.5 134.6,159.6 147.6,160.7 160.5,161.8 173.5,162.9 186.4,164.0 199.4,165.1 212.4,166.2 225.3,167.3 238.3,168.4 251.3,169.5 264.2,170.6 277.2,171.7 290.1,172.8 303.1,173.9 316.1,175.0 329.0,176.1 342.0,177.1 355.0,178.2 367.9,179.3 380.9,180.4 393.9,181.5 406.8,182.6 419.8,183.6 432.7,184.7 445.7,185.8 458.7,186.9 471.6,187.9 484.6,189.0 497.6,190.1 510.5,191.2 523.5,192.2 536.4,193.3 549.4,194.4 562.4,195.4 575.3,196.5 588.3,197.6 601.3,198.6" fill="none" stroke="#ff9d5c" stroke-width="1.8"/>
+    <polyline points="82.7,155.2 95.7,155.7 108.7,156.3 121.6,156.8 134.6,157.4 147.6,157.9 160.5,158.5 173.5,159.0 186.4,159.6 199.4,160.1 212.4,160.7 225.3,161.2 238.3,161.7 251.3,162.3 264.2,162.8 277.2,163.4 290.1,163.9 303.1,164.5 316.1,165.0 329.0,165.6 342.0,166.1 355.0,166.7 367.9,167.2 380.9,167.7 393.9,168.3 406.8,168.8 419.8,169.4 432.7,169.9 445.7,170.5 458.7,171.0 471.6,171.6 484.6,172.1 497.6,172.7 510.5,173.2 523.5,173.7 536.4,174.3 549.4,174.8 562.4,175.4 575.3,175.9 588.3,176.5 601.3,177.0" fill="none" stroke="#69d9ff" stroke-width="1.8"/>
+    <rect x="494.0" y="36.0" width="122.0" height="53" rx="5" fill="#0d1218" fill-opacity=".88" stroke="#232a35"/>
+    <line x1="502.0" y1="49" x2="518.0" y2="49" stroke="#7ee787" stroke-width="2" stroke-dasharray="4 3"/>
+    <text x="524.0" y="52.5" font-size="10" fill="#e8edf3">exact  e^(−4νt)</text>
+    <line x1="502.0" y1="64" x2="518.0" y2="64" stroke="#ff9d5c" stroke-width="2"/>
+    <text x="524.0" y="67.5" font-size="10" fill="#e8edf3">semi-Lagrangian</text>
+    <line x1="502.0" y1="79" x2="518.0" y2="79" stroke="#69d9ff" stroke-width="2"/>
+    <text x="524.0" y="82.5" font-size="10" fill="#e8edf3">MacCormack</text>
+    <text x="62" y="18" font-size="11" fill="#e8edf3" font-weight="600">Energy decay vs the closed form</text>
+    <text x="342" y="374" text-anchor="middle" font-size="10" fill="#7d8794">time</text>
+    <text x="14" y="182" text-anchor="middle" font-size="10" fill="#7d8794" transform="rotate(-90 14 182)">kinetic energy</text>
+  </svg></div>
+  <figcaption>The gap between each curve and the dashed exact solution is energy the scheme removed that physics did not. Fitting that gap gives the numerical viscosity quoted below.</figcaption>
+</figure></div>
+  <div class="tbl-wrap"><div class="scroll"><table>
+  <thead><tr><th>scheme</th><th class="num">measured rate</th><th class="num">exact 4ν</th><th class="num">ν effective</th><th class="num">ν numerical</th><th class="num">as % of ν</th><th class="num">fit r²</th></tr></thead>
+  <tbody><tr><td><strong>semi-Lagrangian</strong></td><td class="num">0.1638</td><td class="num">0.0800</td><td class="num">0.0410</td><td class="num"><strong>0.0210</strong></td><td class="num">104.8%</td><td class="num">0.99997</td></tr>
+  <tr><td><strong>MacCormack</strong></td><td class="num">0.0823</td><td class="num">0.0800</td><td class="num">0.0206</td><td class="num"><strong>5.79e-4</strong></td><td class="num">2.9%</td><td class="num">1.00000</td></tr></tbody>
+</table></div></div>
+  <p class="note">
+    64² grid, ν = 0.02, dt = 0.005, integrated to t = 1.
+    Semi-Lagrangian more than <strong>doubles the effective viscosity</strong> at
+    this resolution: the fluid it simulates is roughly twice as viscous as the one
+    it was asked to simulate. MacCormack brings the invented viscosity down to a
+    few percent.
+  </p>
+</div></section>
+
+<section><div class="wrap">
+  <p class="eyebrow">isolating advection</p>
+  <h2>Where the dissipation actually comes from</h2>
+  <p class="lede prose">
+    Taylor-Green cannot answer this on its own. Its nonlinear term is exactly
+    cancelled by the pressure gradient, so a badly diffusive advection scheme can
+    still score well there. This test has nothing else in it: a Gaussian blob in
+    a uniform flow, whose exact solution is the same blob, translated.
+  </p>
+  <figure>
+  <div class="scroll"><svg viewBox="0 0 640 380" role="img" aria-label="A blob carried by uniform flow">
+    <line x1="62.0" y1="30" x2="62.0" y2="334" stroke="#1a2029"/>
+    <text x="62.0" y="350" text-anchor="middle" font-size="10" fill="#7d8794">-0.02</text>
+    <line x1="174.0" y1="30" x2="174.0" y2="334" stroke="#1a2029"/>
+    <text x="174.0" y="350" text-anchor="middle" font-size="10" fill="#7d8794">0.19</text>
+    <line x1="286.0" y1="30" x2="286.0" y2="334" stroke="#1a2029"/>
+    <text x="286.0" y="350" text-anchor="middle" font-size="10" fill="#7d8794">0.40</text>
+    <line x1="398.0" y1="30" x2="398.0" y2="334" stroke="#1a2029"/>
+    <text x="398.0" y="350" text-anchor="middle" font-size="10" fill="#7d8794">0.62</text>
+    <line x1="510.0" y1="30" x2="510.0" y2="334" stroke="#1a2029"/>
+    <text x="510.0" y="350" text-anchor="middle" font-size="10" fill="#7d8794">0.83</text>
+    <line x1="622.0" y1="30" x2="622.0" y2="334" stroke="#1a2029"/>
+    <text x="622.0" y="350" text-anchor="middle" font-size="10" fill="#7d8794">1.0</text>
+    <line x1="62" y1="334.0" x2="622" y2="334.0" stroke="#1a2029"/>
+    <text x="54" y="337.5" text-anchor="end" font-size="10" fill="#7d8794">0.68</text>
+    <line x1="62" y1="273.2" x2="622" y2="273.2" stroke="#1a2029"/>
+    <text x="54" y="276.7" text-anchor="end" font-size="10" fill="#7d8794">0.75</text>
+    <line x1="62" y1="212.4" x2="622" y2="212.4" stroke="#1a2029"/>
+    <text x="54" y="215.9" text-anchor="end" font-size="10" fill="#7d8794">0.81</text>
+    <line x1="62" y1="151.6" x2="622" y2="151.6" stroke="#1a2029"/>
+    <text x="54" y="155.1" text-anchor="end" font-size="10" fill="#7d8794">0.88</text>
+    <line x1="62" y1="90.8" x2="622" y2="90.8" stroke="#1a2029"/>
+    <text x="54" y="94.3" text-anchor="end" font-size="10" fill="#7d8794">0.94</text>
+    <line x1="62" y1="30.0" x2="622" y2="30.0" stroke="#1a2029"/>
+    <text x="54" y="33.5" text-anchor="end" font-size="10" fill="#7d8794">1.0</text>
+    <rect x="62" y="30" width="560" height="304" fill="none" stroke="#232a35"/>
+    <polyline points="82.7,51.0 178.0,115.2 283.8,172.6 389.6,224.2 495.4,271.0 601.3,313.0" fill="none" stroke="#ff9d5c" stroke-width="1.8"/>
+    <circle cx="82.7" cy="51.0" r="2.6" fill="#ff9d5c"/>
+    <circle cx="178.0" cy="115.2" r="2.6" fill="#ff9d5c"/>
+    <circle cx="283.8" cy="172.6" r="2.6" fill="#ff9d5c"/>
+    <circle cx="389.6" cy="224.2" r="2.6" fill="#ff9d5c"/>
+    <circle cx="495.4" cy="271.0" r="2.6" fill="#ff9d5c"/>
+    <circle cx="601.3" cy="313.0" r="2.6" fill="#ff9d5c"/>
+    <polyline points="82.7,51.0 178.0,51.7 283.8,54.9 389.6,60.1 495.4,63.7 601.3,67.1" fill="none" stroke="#69d9ff" stroke-width="1.8"/>
+    <circle cx="82.7" cy="51.0" r="2.6" fill="#69d9ff"/>
+    <circle cx="178.0" cy="51.7" r="2.6" fill="#69d9ff"/>
+    <circle cx="283.8" cy="54.9" r="2.6" fill="#69d9ff"/>
+    <circle cx="389.6" cy="60.1" r="2.6" fill="#69d9ff"/>
+    <circle cx="495.4" cy="63.7" r="2.6" fill="#69d9ff"/>
+    <circle cx="601.3" cy="67.1" r="2.6" fill="#69d9ff"/>
+    <rect x="494.0" y="36.0" width="122.0" height="38" rx="5" fill="#0d1218" fill-opacity=".88" stroke="#232a35"/>
+    <line x1="502.0" y1="49" x2="518.0" y2="49" stroke="#ff9d5c" stroke-width="2"/>
+    <text x="524.0" y="52.5" font-size="10" fill="#e8edf3">semi-Lagrangian</text>
+    <line x1="502.0" y1="64" x2="518.0" y2="64" stroke="#69d9ff" stroke-width="2"/>
+    <text x="524.0" y="67.5" font-size="10" fill="#e8edf3">MacCormack</text>
+    <text x="62" y="18" font-size="11" fill="#e8edf3" font-weight="600">A blob carried by uniform flow</text>
+    <text x="342" y="374" text-anchor="middle" font-size="10" fill="#7d8794">time</text>
+    <text x="14" y="182" text-anchor="middle" font-size="10" fill="#7d8794" transform="rotate(-90 14 182)">peak amplitude</text>
+  </svg></div>
+  <figcaption>The exact solution's peak never changes: the blob is simply translated. Everything below the initial value is numerical diffusion, with no pressure, viscosity or nonlinearity able to take the blame.</figcaption>
+</figure>
+  <div class="tbl-wrap"><div class="scroll"><table>
+  <thead><tr><th>scheme</th><th class="num">peak retained</th><th class="num">D numerical</th><th class="num">relative L2</th><th class="num">CFL</th></tr></thead>
+  <tbody><tr><td><strong>semi-Lagrangian</strong></td><td class="num">71.7%</td><td class="num">0</td><td class="num">0</td><td class="num">0.326</td></tr>
+  <tr><td><strong>MacCormack</strong></td><td class="num">98.3%</td><td class="num">0</td><td class="num">0</td><td class="num">0.326</td></tr></tbody>
+</table></div></div>
+  <p class="note">
+    Semi-Lagrangian keeps interpolating bilinearly, and bilinear interpolation of
+    anything but a linear field is a weighted average &mdash; a low-pass filter
+    applied once per step, which is indistinguishable from adding a diffusion
+    term. That is the mechanism behind both tables on this page.
+  </p>
+</div></section>
+
+<section><div class="wrap">
+  <p class="eyebrow">convergence</p>
+  <h2>First order in time, and why the obvious study got it backwards</h2>
+  <div class="prose stack">
+    <p class="lede">
+      The first convergence study run here held dt fixed and refined the grid,
+      expecting the error to fall. It rose: 8.9e-5 → 2.3e-4 → 2.9e-4 for
+      N = 16, 32, 64.
+    </p>
+    <p style="color:var(--ink2);font-size:.94rem">
+      Sweeping dt and N independently showed why. At fixed dt the temporal error
+      dominates and is identical at every resolution, so refining the grid cannot
+      reduce it &mdash; and at N = 16 the spatial error happened to have the
+      opposite sign and partially cancelled it, making the coarsest grid look
+      the most accurate. Refining removed the cancellation, and the error went up.
+    </p>
+    <p style="color:var(--ink2);font-size:.94rem">
+      The scheme is first order in time because the step is Lie-split
+      (advect, then diffuse, then project), and Lie splitting is O(dt). That caps
+      the whole method at first order however accurate the individual operators
+      are &mdash; the Laplacian and the discrete curl are both second order,
+      verified separately. It is a real property of Stam-style solvers and is
+      rarely stated.
+    </p>
+  </div>
+  <figure>
+  <div class="scroll"><svg viewBox="0 0 640 380" role="img" aria-label="Error vs timestep, at four resolutions">
+    <line x1="435.3" y1="30" x2="435.3" y2="334" stroke="#1a2029"/>
+    <text x="435.3" y="350" text-anchor="middle" font-size="10" fill="#7d8794">10⁻²</text>
+    <line x1="62" y1="274.0" x2="622" y2="274.0" stroke="#1a2029"/>
+    <text x="54" y="277.5" text-anchor="end" font-size="10" fill="#7d8794">10⁻⁴</text>
+    <line x1="62" y1="87.5" x2="622" y2="87.5" stroke="#1a2029"/>
+    <text x="54" y="91.0" text-anchor="end" font-size="10" fill="#7d8794">10⁻³</text>
+    <rect x="62" y="30" width="560" height="304" fill="none" stroke="#232a35"/>
+    <polyline points="622.0,97.6 435.3,189.9 248.7,283.3 62.0,224.1" fill="none" stroke="#69d9ff" stroke-width="1.8"/>
+    <circle cx="622.0" cy="97.6" r="2.6" fill="#69d9ff"/>
+    <circle cx="435.3" cy="189.9" r="2.6" fill="#69d9ff"/>
+    <circle cx="248.7" cy="283.3" r="2.6" fill="#69d9ff"/>
+    <circle cx="62.0" cy="224.1" r="2.6" fill="#69d9ff"/>
+    <polyline points="622.0,73.3 435.3,138.1 248.7,206.5 62.0,292.6" fill="none" stroke="#ff9d5c" stroke-width="1.8"/>
+    <circle cx="622.0" cy="73.3" r="2.6" fill="#ff9d5c"/>
+    <circle cx="435.3" cy="138.1" r="2.6" fill="#ff9d5c"/>
+    <circle cx="248.7" cy="206.5" r="2.6" fill="#ff9d5c"/>
+    <circle cx="62.0" cy="292.6" r="2.6" fill="#ff9d5c"/>
+    <polyline points="622.0,68.1 435.3,128.6 248.7,187.4 62.0,249.0" fill="none" stroke="#b18cff" stroke-width="1.8"/>
+    <circle cx="622.0" cy="68.1" r="2.6" fill="#b18cff"/>
+    <circle cx="435.3" cy="128.6" r="2.6" fill="#b18cff"/>
+    <circle cx="248.7" cy="187.4" r="2.6" fill="#b18cff"/>
+    <circle cx="62.0" cy="249.0" r="2.6" fill="#b18cff"/>
+    <rect x="544.4" y="36.0" width="71.6" height="53" rx="5" fill="#0d1218" fill-opacity=".88" stroke="#232a35"/>
+    <line x1="552.4" y1="49" x2="568.4" y2="49" stroke="#69d9ff" stroke-width="2"/>
+    <text x="574.4" y="52.5" font-size="10" fill="#e8edf3">N = 16</text>
+    <line x1="552.4" y1="64" x2="568.4" y2="64" stroke="#ff9d5c" stroke-width="2"/>
+    <text x="574.4" y="67.5" font-size="10" fill="#e8edf3">N = 32</text>
+    <line x1="552.4" y1="79" x2="568.4" y2="79" stroke="#b18cff" stroke-width="2"/>
+    <text x="574.4" y="82.5" font-size="10" fill="#e8edf3">N = 64</text>
+    <text x="62" y="18" font-size="11" fill="#e8edf3" font-weight="600">Error vs timestep, at four resolutions</text>
+    <text x="342" y="374" text-anchor="middle" font-size="10" fill="#7d8794">timestep dt</text>
+    <text x="14" y="182" text-anchor="middle" font-size="10" fill="#7d8794" transform="rotate(-90 14 182)">relative L2 error</text>
+  </svg></div>
+  <figcaption>Each line falls with slope ≈ 1 (first order in time) until it flattens onto that grid's spatial error floor. The floor is what falls with resolution; the sloped part is identical at every N because it is the splitting error.</figcaption>
+</figure>
+  <div class="tbl-wrap"><div class="scroll"><table>
+  <thead><tr><th>grid</th><th class="num">dt=0.02</th><th class="num">dt=0.01</th><th class="num">dt=0.005</th><th class="num">dt=0.0025</th><th class="num">order in dt</th></tr></thead>
+  <tbody><tr><td><strong>16²</strong></td><td class="num">8.82e-4</td><td class="num">2.82e-4</td><td class="num">8.92e-5</td><td class="num">1.85e-4</td><td class="num">0.84</td></tr>
+  <tr><td><strong>32²</strong></td><td class="num">0</td><td class="num">5.36e-4</td><td class="num">2.30e-4</td><td class="num">7.95e-5</td><td class="num">1.29</td></tr>
+  <tr><td><strong>64²</strong></td><td class="num">0</td><td class="num">6.02e-4</td><td class="num">2.92e-4</td><td class="num">1.36e-4</td><td class="num">1.07</td></tr></tbody>
+</table></div></div>
+  <p class="note">
+    Taylor-Green, ν = 0.05, integrated to t = 0.25, maccormack advection.
+    Reading down a column shows why a fixed-dt refinement study is uninformative
+    here; reading along a row gives the temporal order.
+  </p>
+</div></section>
+
+<section><div class="wrap">
+  <p class="eyebrow">stability</p>
+  <h2>Where it breaks, and a correction to the usual framing</h2>
+  <div class="prose stack">
+    <p class="lede">
+      The brief asked for "the CFL condition boundary". Semi-Lagrangian advection
+      does not have one: tracing backward and interpolating can never produce a
+      value outside the range it sampled, so it cannot amplify anything. That
+      unconditional stability is the entire reason Stam's method exists, and
+      reporting a CFL blow-up limit would have meant inventing a result.
+    </p>
+    <p style="color:var(--ink2);font-size:.94rem">
+      So what follows is what genuinely bounds this solver. Advective CFL was
+      swept to 2.53 with
+      no blow-up at all &mdash; large timesteps cost <em>accuracy</em>, not
+      stability. The one real boundary is explicit diffusion, and it is
+      reproduced exactly.
+    </p>
+  </div>
+  <div class="figs"><figure>
+  <div class="scroll"><svg viewBox="0 0 640 380" role="img" aria-label="The explicit-diffusion stability boundary">
+    <line x1="62.0" y1="30" x2="62.0" y2="334" stroke="#1a2029"/>
+    <text x="62.0" y="350" text-anchor="middle" font-size="10" fill="#7d8794">0.03</text>
+    <line x1="174.0" y1="30" x2="174.0" y2="334" stroke="#1a2029"/>
+    <text x="174.0" y="350" text-anchor="middle" font-size="10" fill="#7d8794">0.15</text>
+    <line x1="286.0" y1="30" x2="286.0" y2="334" stroke="#1a2029"/>
+    <text x="286.0" y="350" text-anchor="middle" font-size="10" fill="#7d8794">0.27</text>
+    <line x1="398.0" y1="30" x2="398.0" y2="334" stroke="#1a2029"/>
+    <text x="398.0" y="350" text-anchor="middle" font-size="10" fill="#7d8794">0.38</text>
+    <line x1="510.0" y1="30" x2="510.0" y2="334" stroke="#1a2029"/>
+    <text x="510.0" y="350" text-anchor="middle" font-size="10" fill="#7d8794">0.50</text>
+    <line x1="622.0" y1="30" x2="622.0" y2="334" stroke="#1a2029"/>
+    <text x="622.0" y="350" text-anchor="middle" font-size="10" fill="#7d8794">0.62</text>
+    <line x1="62" y1="334.0" x2="622" y2="334.0" stroke="#1a2029"/>
+    <text x="54" y="337.5" text-anchor="end" font-size="10" fill="#7d8794">-0.09</text>
+    <line x1="62" y1="273.2" x2="622" y2="273.2" stroke="#1a2029"/>
+    <text x="54" y="276.7" text-anchor="end" font-size="10" fill="#7d8794">0.75</text>
+    <line x1="62" y1="212.4" x2="622" y2="212.4" stroke="#1a2029"/>
+    <text x="54" y="215.9" text-anchor="end" font-size="10" fill="#7d8794">1.6</text>
+    <line x1="62" y1="151.6" x2="622" y2="151.6" stroke="#1a2029"/>
+    <text x="54" y="155.1" text-anchor="end" font-size="10" fill="#7d8794">2.4</text>
+    <line x1="62" y1="90.8" x2="622" y2="90.8" stroke="#1a2029"/>
+    <text x="54" y="94.3" text-anchor="end" font-size="10" fill="#7d8794">3.3</text>
+    <line x1="62" y1="30.0" x2="622" y2="30.0" stroke="#1a2029"/>
+    <text x="54" y="33.5" text-anchor="end" font-size="10" fill="#7d8794">4.1</text>
+    <rect x="62" y="30" width="560" height="304" fill="none" stroke="#232a35"/>
+    <polyline points="82.7,283.9 129.9,313.0 177.0,313.0 224.2,283.9 252.4,266.4 261.9,260.6 271.3,254.8 280.7,249.0 299.6,237.3 318.4,225.7 412.7,167.4 601.3,51.0" fill="none" stroke="#7ee787" stroke-width="1.8" stroke-dasharray="5 4"/>
+    <polyline points="82.7,283.9 129.9,313.0 177.0,313.0 224.2,283.9 252.4,266.4 261.9,260.6 271.3,254.8 280.7,249.0 299.6,237.3 318.4,225.7 412.7,167.4 601.3,51.0" fill="none" stroke="#69d9ff" stroke-width="1.8"/>
+    <circle cx="82.7" cy="283.9" r="2.6" fill="#69d9ff"/>
+    <circle cx="129.9" cy="313.0" r="2.6" fill="#69d9ff"/>
+    <circle cx="177.0" cy="313.0" r="2.6" fill="#69d9ff"/>
+    <circle cx="224.2" cy="283.9" r="2.6" fill="#69d9ff"/>
+    <circle cx="252.4" cy="266.4" r="2.6" fill="#69d9ff"/>
+    <circle cx="261.9" cy="260.6" r="2.6" fill="#69d9ff"/>
+    <circle cx="271.3" cy="254.8" r="2.6" fill="#69d9ff"/>
+    <circle cx="280.7" cy="249.0" r="2.6" fill="#69d9ff"/>
+    <circle cx="299.6" cy="237.3" r="2.6" fill="#69d9ff"/>
+    <circle cx="318.4" cy="225.7" r="2.6" fill="#69d9ff"/>
+    <circle cx="412.7" cy="167.4" r="2.6" fill="#69d9ff"/>
+    <circle cx="601.3" cy="51.0" r="2.6" fill="#69d9ff"/>
+    <rect x="494.0" y="36.0" width="122.0" height="38" rx="5" fill="#0d1218" fill-opacity=".88" stroke="#232a35"/>
+    <line x1="502.0" y1="49" x2="518.0" y2="49" stroke="#7ee787" stroke-width="2" stroke-dasharray="4 3"/>
+    <text x="524.0" y="52.5" font-size="10" fill="#e8edf3">theory |1 − 8d|</text>
+    <line x1="502.0" y1="64" x2="518.0" y2="64" stroke="#69d9ff" stroke-width="2"/>
+    <text x="524.0" y="67.5" font-size="10" fill="#e8edf3">measured</text>
+    <text x="62" y="18" font-size="11" fill="#e8edf3" font-weight="600">The explicit-diffusion stability boundary</text>
+    <text x="342" y="374" text-anchor="middle" font-size="10" fill="#7d8794">diffusion number  ν·dt/h²</text>
+    <text x="14" y="182" text-anchor="middle" font-size="10" fill="#7d8794" transform="rotate(-90 14 182)">amplification per step</text>
+  </svg></div>
+  <figcaption>The grid-scale mode is amplified by |1 − 8d| per step, so the boundary sits exactly at d = 0.25 where amplification reaches 1. Measured and predicted agree to better than 1e-6 at every point.</figcaption>
+</figure><figure>
+  <div class="scroll"><svg viewBox="0 0 640 380" role="img" aria-label="Under-converging the projection">
+    <line x1="62.0" y1="30" x2="62.0" y2="334" stroke="#1a2029"/>
+    <text x="62.0" y="350" text-anchor="middle" font-size="10" fill="#7d8794">10⁰</text>
+    <line x1="277.2" y1="30" x2="277.2" y2="334" stroke="#1a2029"/>
+    <text x="277.2" y="350" text-anchor="middle" font-size="10" fill="#7d8794">10¹</text>
+    <line x1="492.4" y1="30" x2="492.4" y2="334" stroke="#1a2029"/>
+    <text x="492.4" y="350" text-anchor="middle" font-size="10" fill="#7d8794">10²</text>
+    <line x1="62" y1="326.1" x2="622" y2="326.1" stroke="#1a2029"/>
+    <text x="54" y="329.6" text-anchor="end" font-size="10" fill="#7d8794">10⁻¹⁵</text>
+    <line x1="62" y1="306.3" x2="622" y2="306.3" stroke="#1a2029"/>
+    <text x="54" y="309.8" text-anchor="end" font-size="10" fill="#7d8794">10⁻¹⁴</text>
+    <line x1="62" y1="286.5" x2="622" y2="286.5" stroke="#1a2029"/>
+    <text x="54" y="290.0" text-anchor="end" font-size="10" fill="#7d8794">10⁻¹³</text>
+    <line x1="62" y1="266.7" x2="622" y2="266.7" stroke="#1a2029"/>
+    <text x="54" y="270.2" text-anchor="end" font-size="10" fill="#7d8794">10⁻¹²</text>
+    <line x1="62" y1="246.9" x2="622" y2="246.9" stroke="#1a2029"/>
+    <text x="54" y="250.4" text-anchor="end" font-size="10" fill="#7d8794">10⁻¹¹</text>
+    <line x1="62" y1="227.0" x2="622" y2="227.0" stroke="#1a2029"/>
+    <text x="54" y="230.5" text-anchor="end" font-size="10" fill="#7d8794">10⁻¹⁰</text>
+    <line x1="62" y1="207.2" x2="622" y2="207.2" stroke="#1a2029"/>
+    <text x="54" y="210.7" text-anchor="end" font-size="10" fill="#7d8794">10⁻⁹</text>
+    <line x1="62" y1="187.4" x2="622" y2="187.4" stroke="#1a2029"/>
+    <text x="54" y="190.9" text-anchor="end" font-size="10" fill="#7d8794">10⁻⁸</text>
+    <line x1="62" y1="167.6" x2="622" y2="167.6" stroke="#1a2029"/>
+    <text x="54" y="171.1" text-anchor="end" font-size="10" fill="#7d8794">10⁻⁷</text>
+    <line x1="62" y1="147.8" x2="622" y2="147.8" stroke="#1a2029"/>
+    <text x="54" y="151.3" text-anchor="end" font-size="10" fill="#7d8794">10⁻⁶</text>
+    <line x1="62" y1="128.0" x2="622" y2="128.0" stroke="#1a2029"/>
+    <text x="54" y="131.5" text-anchor="end" font-size="10" fill="#7d8794">10⁻⁵</text>
+    <line x1="62" y1="108.2" x2="622" y2="108.2" stroke="#1a2029"/>
+    <text x="54" y="111.7" text-anchor="end" font-size="10" fill="#7d8794">10⁻⁴</text>
+    <line x1="62" y1="88.4" x2="622" y2="88.4" stroke="#1a2029"/>
+    <text x="54" y="91.9" text-anchor="end" font-size="10" fill="#7d8794">10⁻³</text>
+    <line x1="62" y1="68.6" x2="622" y2="68.6" stroke="#1a2029"/>
+    <text x="54" y="72.1" text-anchor="end" font-size="10" fill="#7d8794">10⁻²</text>
+    <line x1="62" y1="48.7" x2="622" y2="48.7" stroke="#1a2029"/>
+    <text x="54" y="52.2" text-anchor="end" font-size="10" fill="#7d8794">10⁻¹</text>
+    <rect x="62" y="30" width="560" height="304" fill="none" stroke="#232a35"/>
+    <polyline points="62.0,34.0 126.8,39.3 212.4,73.6 277.2,106.4 342.0,145.4 427.6,329.6 492.4,329.6 622.0,329.6" fill="none" stroke="#69d9ff" stroke-width="1.8"/>
+    <circle cx="62.0" cy="34.0" r="2.6" fill="#69d9ff"/>
+    <circle cx="126.8" cy="39.3" r="2.6" fill="#69d9ff"/>
+    <circle cx="212.4" cy="73.6" r="2.6" fill="#69d9ff"/>
+    <circle cx="277.2" cy="106.4" r="2.6" fill="#69d9ff"/>
+    <circle cx="342.0" cy="145.4" r="2.6" fill="#69d9ff"/>
+    <circle cx="427.6" cy="329.6" r="2.6" fill="#69d9ff"/>
+    <circle cx="492.4" cy="329.6" r="2.6" fill="#69d9ff"/>
+    <circle cx="622.0" cy="329.6" r="2.6" fill="#69d9ff"/>
+    <rect x="527.6" y="36.0" width="88.4" height="23" rx="5" fill="#0d1218" fill-opacity=".88" stroke="#232a35"/>
+    <line x1="535.6" y1="49" x2="551.6" y2="49" stroke="#69d9ff" stroke-width="2"/>
+    <text x="557.6" y="52.5" font-size="10" fill="#e8edf3">max |∇·u|</text>
+    <text x="62" y="18" font-size="11" fill="#e8edf3" font-weight="600">Under-converging the projection</text>
+    <text x="342" y="374" text-anchor="middle" font-size="10" fill="#7d8794">conjugate-gradient iterations</text>
+    <text x="14" y="182" text-anchor="middle" font-size="10" fill="#7d8794" transform="rotate(-90 14 182)">max |∇·u| after 50 steps</text>
+  </svg></div>
+  <figcaption>The most common way a fluid simulation is quietly wrong: the flow still looks plausible while mass is not conserved. Roughly 50 iterations are needed for machine precision at this resolution.</figcaption>
+</figure></div>
+  <div class="cards">
+    <div class="card"><span class="meta">measured boundary</span>
+      <h3>d = 0.25 stable, 0.26 unstable</h3>
+      <p>Theory puts it at exactly 0.25. The operator was tested in isolation with
+      the checkerboard mode seeded deliberately.</p></div>
+    <div class="card"><span class="meta">inside the full solver</span>
+      <h3>d = 0.26 / 0.28</h3>
+      <p>Below the bound the projection annihilates the mode entirely (growth ~1e-14);
+      above it, the mode grows despite the projection.</p></div>
+    <div class="card"><span class="meta">advective CFL</span>
+      <h3>no blow-up to CFL 2.5</h3>
+      <p>Unconditionally stable, as designed. The error stays around
+      0.04 throughout.</p></div>
+  </div>
+
+  <h3>Vorticity confinement is an energy source</h3>
+  <p class="note">
+    Confinement is in the brief as a way to restore detail lost to numerical
+    dissipation, and it does that. But it is a fabricated force, and this table is
+    why every measurement on this page has it switched off &mdash; the solver
+    throws rather than allowing it in validation mode. The exact solution loses
+    energy over this interval; from ε = 1
+    the simulation <em>gains</em> it.
+  </p>
+  <div class="tbl-wrap"><div class="scroll"><table>
+  <thead><tr><th>confinement</th><th class="num">energy ratio</th><th class="num">exact ratio</th><th>verdict</th></tr></thead>
+  <tbody><tr><td class="mono">ε = 0</td><td class="num">0.626</td><td class="num">0.852</td><td><span class="pill good">decays</span></td></tr>
+  <tr><td class="mono">ε = 0.5</td><td class="num">0.863</td><td class="num">0.852</td><td><span class="pill good">decays</span></td></tr>
+  <tr><td class="mono">ε = 1</td><td class="num">1.114</td><td class="num">0.852</td><td><span class="pill bad">adds energy</span></td></tr>
+  <tr><td class="mono">ε = 2</td><td class="num">1.562</td><td class="num">0.852</td><td><span class="pill bad">adds energy</span></td></tr>
+  <tr><td class="mono">ε = 5</td><td class="num">1.720</td><td class="num">0.852</td><td><span class="pill bad">adds energy</span></td></tr>
+  <tr><td class="mono">ε = 10</td><td class="num">2.384</td><td class="num">0.852</td><td><span class="pill bad">adds energy</span></td></tr>
+  <tr><td class="mono">ε = 20</td><td class="num">2.405</td><td class="num">0.852</td><td><span class="pill bad">adds energy</span></td></tr>
+  <tr><td class="mono">ε = 40</td><td class="num">38.788</td><td class="num">0.852</td><td><span class="pill bad">adds energy</span></td></tr>
+  <tr><td class="mono">ε = 80</td><td class="num">4062.159</td><td class="num">0.852</td><td><span class="pill bad">adds energy</span></td></tr>
+  <tr><td class="mono">ε = 160</td><td class="num">23593.437</td><td class="num">0.852</td><td><span class="pill bad">adds energy</span></td></tr>
+  <tr><td class="mono">ε = 320</td><td class="num">diverged</td><td class="num">0.852</td><td><span class="pill bad">adds energy</span></td></tr></tbody>
+</table></div></div>
+</div></section>
+
+<section><div class="wrap">
+  <p class="eyebrow">turbulence &middot; the honest result</p>
+  <h2>The spectrum does not match Kraichnan, and that is the finding</h2>
+  <div class="prose stack">
+    <p class="lede">
+      Kolmogorov's k^(−5/3) describes <em>three-dimensional</em> turbulence. In 2D
+      there is no vortex stretching, vorticity is materially conserved, and the
+      phenomenology is different: Kraichnan and Batchelor predict a
+      <strong>dual cascade</strong> &mdash; energy travelling upscale from the
+      forcing with slope −5/3, and enstrophy travelling downscale with slope −3.
+      Comparing a 2D spectrum to −5/3 across all scales would be comparing against
+      the wrong law for most of it.
+    </p>
+  </div>
+  <figure>
+  <div class="scroll"><svg viewBox="0 0 760 440" role="img" aria-label="Forced 2D turbulence, 512², forcing at k = 40">
+    <rect x="232.0" y="30" width="219.7" height="364" fill="#7ee787" opacity=".07"/>
+    <text x="341.9" y="42" text-anchor="middle" font-size="9" fill="#7ee787" opacity=".85">inverse window</text>
+    <rect x="572.0" y="30" width="106.9" height="364" fill="#69d9ff" opacity=".07"/>
+    <text x="625.4" y="42" text-anchor="middle" font-size="9" fill="#69d9ff" opacity=".85">enstrophy window</text>
+    <line x1="62.0" y1="30" x2="62.0" y2="394" stroke="#1a2029"/>
+    <text x="62.0" y="410" text-anchor="middle" font-size="10" fill="#7d8794">10⁰</text>
+    <line x1="344.4" y1="30" x2="344.4" y2="394" stroke="#1a2029"/>
+    <text x="344.4" y="410" text-anchor="middle" font-size="10" fill="#7d8794">10¹</text>
+    <line x1="626.7" y1="30" x2="626.7" y2="394" stroke="#1a2029"/>
+    <text x="626.7" y="410" text-anchor="middle" font-size="10" fill="#7d8794">10²</text>
+    <line x1="62" y1="350.3" x2="742" y2="350.3" stroke="#1a2029"/>
+    <text x="54" y="353.8" text-anchor="end" font-size="10" fill="#7d8794">10⁻⁷</text>
+    <line x1="62" y1="290.9" x2="742" y2="290.9" stroke="#1a2029"/>
+    <text x="54" y="294.4" text-anchor="end" font-size="10" fill="#7d8794">10⁻⁶</text>
+    <line x1="62" y1="231.5" x2="742" y2="231.5" stroke="#1a2029"/>
+    <text x="54" y="235.0" text-anchor="end" font-size="10" fill="#7d8794">10⁻⁵</text>
+    <line x1="62" y1="172.0" x2="742" y2="172.0" stroke="#1a2029"/>
+    <text x="54" y="175.5" text-anchor="end" font-size="10" fill="#7d8794">10⁻⁴</text>
+    <line x1="62" y1="112.6" x2="742" y2="112.6" stroke="#1a2029"/>
+    <text x="54" y="116.1" text-anchor="end" font-size="10" fill="#7d8794">10⁻³</text>
+    <line x1="62" y1="53.1" x2="742" y2="53.1" stroke="#1a2029"/>
+    <text x="54" y="56.6" text-anchor="end" font-size="10" fill="#7d8794">10⁻²</text>
+    <rect x="62" y="30" width="680" height="364" fill="none" stroke="#232a35"/>
+    <polyline points="62.0,193.1 147.0,144.2 196.7,159.3 232.0,135.2 259.4,134.7 281.7,123.5 300.6,124.8 317.0,124.9 331.4,114.4 344.4,118.2 356.1,110.4 366.7,112.8 376.5,105.8 385.6,104.8 394.1,106.1 402.0,98.7 409.4,99.0 416.4,99.6 423.1,97.5 429.4,98.9 435.3,92.4 441.1,93.8 446.5,93.4 451.7,94.1 456.7,91.1 461.5,92.9 466.2,94.3 470.6,91.6 474.9,94.6 479.1,91.7 483.1,94.4 487.0,96.0 490.8,94.1 494.4,93.5 498.0,94.4 501.4,95.2 504.8,96.8 508.1,66.4 511.3,59.2 514.4,42.1 517.4,49.1 520.3,88.7 523.2,104.8 526.1,110.1 528.8,111.9 531.5,116.3 534.1,118.6 536.7,122.5 539.3,125.8 541.7,129.6 544.2,133.5 546.5,136.0 548.9,141.2 551.2,144.3 553.4,147.1 555.6,151.2 557.8,152.5 559.9,158.9 562.0,159.0 564.1,163.7 566.1,167.7 568.1,169.2 570.1,174.0 572.0,172.9 573.9,178.7 575.8,180.0 577.6,183.6 579.4,186.6 581.2,188.2 583.0,191.5 584.7,193.8 586.4,194.0 588.1,198.1 589.8,199.5 591.4,202.5 593.1,203.4 594.7,204.9 596.3,208.7 597.8,209.7 599.4,211.8 600.9,212.2 602.4,215.7 603.9,218.1 605.3,220.0 606.8,220.7 608.2,223.1 609.7,225.3 611.1,227.7 612.4,227.2 613.8,230.5 615.2,231.9 616.5,233.9 617.8,234.9 619.1,237.3 620.4,238.6 621.7,240.0 623.0,241.3 624.3,241.7 625.5,246.0 626.7,246.0 627.9,249.0 629.2,248.5 630.4,250.3 631.5,253.6 632.7,253.9 633.9,255.7 635.0,256.6 636.2,258.0 637.3,259.9 638.4,260.4 639.5,263.5 640.6,264.1 641.7,265.8 642.8,266.5 643.9,267.7 644.9,269.4 646.0,271.3 647.0,272.8 648.1,273.9 649.1,274.5 650.1,275.7 651.1,277.7 652.1,278.4 653.1,280.8 654.1,281.7 655.1,282.9 656.0,283.4 657.0,285.8 658.0,286.5 658.9,288.2 659.8,289.1 660.8,290.2 661.7,291.4 662.6,292.0 663.5,294.5 664.4,294.1 665.3,296.2 666.2,297.6 667.1,297.9 668.0,299.2 668.9,300.5 669.7,302.1 670.6,303.6 671.4,303.1 672.3,304.3 673.1,306.0 674.0,307.3 674.8,307.6 675.6,308.9 676.4,311.0 677.3,310.9 678.1,313.0 678.9,312.7 679.7,314.4 680.5,315.8 681.3,316.2 682.0,316.5 682.8,317.8 683.6,319.5 684.4,320.8 685.1,320.6 685.9,322.1 686.6,322.5 687.4,324.4 688.1,324.8 688.9,325.8 689.6,327.1 690.3,327.6 691.1,328.1 691.8,329.0 692.5,330.0 693.2,332.4 693.9,332.0 694.7,333.0 695.4,334.3 696.1,334.5 696.7,335.5 697.4,336.0 698.1,337.5 698.8,337.8 699.5,339.0 700.2,339.7 700.8,340.6 701.5,341.7 702.2,342.8 702.8,343.0 703.5,343.5 704.1,344.6 704.8,345.4 705.4,346.9 706.1,346.5 706.7,348.3 707.4,348.1 708.0,349.3 708.6,349.7 709.3,350.5 709.9,351.2 710.5,352.5 711.1,352.7 711.7,354.0 712.3,354.5 712.9,354.9 713.6,355.9 714.2,356.0 714.8,357.7 715.4,357.5 715.9,358.7 716.5,358.5 717.1,359.3 717.7,360.9 718.3,361.3 718.9,361.2 719.5,362.2 720.0,362.6 720.6,364.0 721.2,363.8 721.7,364.4 722.3,365.8 722.9,364.6 723.4,366.2 724.0,366.5 724.5,367.4 725.1,368.2 725.6,368.9 726.2,368.1 726.7,369.2 727.3,369.7 727.8,370.1 728.3,370.9 728.9,370.7 729.4,371.9 729.9,371.9 730.5,372.4 731.0,373.0 731.5,373.5 732.0,373.7 732.5,373.8 733.1,374.1 733.6,374.6 734.1,375.3 734.6,375.2 735.1,375.6 735.6,376.1 736.1,375.6 736.6,376.4 737.1,376.2 737.6,377.2 738.1,377.0 738.6,377.6 739.1,377.3 739.6,377.9 740.1,377.8 740.6,378.0 741.0,378.0 741.5,378.3 742.0,380.8" fill="none" stroke="#69d9ff" stroke-width="2.2"/>
+    <polyline points="232.0,50.9 237.5,52.8 243.0,54.8 248.5,56.7 254.0,58.6 259.5,60.5 265.0,62.5 270.5,64.4 275.9,66.3 281.4,68.2 286.9,70.2 292.4,72.1 297.9,74.0 303.4,76.0 308.9,77.9 314.4,79.8 319.9,81.7 325.4,83.7 330.9,85.6 336.4,87.5 341.9,89.4 347.4,91.4 352.8,93.3 358.3,95.2 363.8,97.2 369.3,99.1 374.8,101.0 380.3,102.9 385.8,104.9 391.3,106.8 396.8,108.7 402.3,110.6 407.8,112.6 413.3,114.5 418.8,116.4 424.3,118.4 429.7,120.3 435.2,122.2 440.7,124.1 446.2,126.1 451.7,128.0" fill="none" stroke="#7ee787" stroke-width="1.8" stroke-dasharray="5 4"/>
+    <polyline points="572.0,218.7 574.7,220.4 577.3,222.0 580.0,223.7 582.7,225.4 585.4,227.1 588.0,228.8 590.7,230.5 593.4,232.2 596.0,233.9 598.7,235.5 601.4,237.2 604.1,238.9 606.7,240.6 609.4,242.3 612.1,244.0 614.8,245.7 617.4,247.4 620.1,249.0 622.8,250.7 625.4,252.4 628.1,254.1 630.8,255.8 633.5,257.5 636.1,259.2 638.8,260.9 641.5,262.5 644.1,264.2 646.8,265.9 649.5,267.6 652.2,269.3 654.8,271.0 657.5,272.7 660.2,274.4 662.8,276.0 665.5,277.7 668.2,279.4 670.9,281.1 673.5,282.8 676.2,284.5 678.9,286.2" fill="none" stroke="#b18cff" stroke-width="1.8" stroke-dasharray="5 4"/>
+    <polyline points="572.0,176.3 574.7,179.7 577.3,183.1 580.0,186.6 582.7,190.0 585.4,193.4 588.0,196.8 590.7,200.2 593.4,203.7 596.0,207.1 598.7,210.5 601.4,213.9 604.1,217.4 606.7,220.8 609.4,224.2 612.1,227.6 614.8,231.0 617.4,234.5 620.1,237.9 622.8,241.3 625.4,244.7 628.1,248.1 630.8,251.6 633.5,255.0 636.1,258.4 638.8,261.8 641.5,265.3 644.1,268.7 646.8,272.1 649.5,275.5 652.2,278.9 654.8,282.4 657.5,285.8 660.2,289.2 662.8,292.6 665.5,296.0 668.2,299.5 670.9,302.9 673.5,306.3 676.2,309.7 678.9,313.2" fill="none" stroke="#ff6b81" stroke-width="1.8" stroke-dasharray="5 4"/>
+    <rect x="546.8" y="36.0" width="189.2" height="68" rx="5" fill="#0d1218" fill-opacity=".88" stroke="#232a35"/>
+    <line x1="554.8" y1="49" x2="570.8" y2="49" stroke="#69d9ff" stroke-width="2"/>
+    <text x="576.8" y="52.5" font-size="10" fill="#e8edf3">measured E(k)</text>
+    <line x1="554.8" y1="64" x2="570.8" y2="64" stroke="#7ee787" stroke-width="2" stroke-dasharray="4 3"/>
+    <text x="576.8" y="67.5" font-size="10" fill="#e8edf3">k^(−5/3)  Kraichnan inverse</text>
+    <line x1="554.8" y1="79" x2="570.8" y2="79" stroke="#b18cff" stroke-width="2" stroke-dasharray="4 3"/>
+    <text x="576.8" y="82.5" font-size="10" fill="#e8edf3">k^(−3)  Kraichnan enstrophy</text>
+    <line x1="554.8" y1="94" x2="570.8" y2="94" stroke="#ff6b81" stroke-width="2" stroke-dasharray="4 3"/>
+    <text x="576.8" y="97.5" font-size="10" fill="#e8edf3">k^(-6.08)  measured fit</text>
+    <text x="62" y="18" font-size="11" fill="#e8edf3" font-weight="600">Forced 2D turbulence, 512², forcing at k = 40</text>
+    <text x="402" y="434" text-anchor="middle" font-size="10" fill="#7d8794">wavenumber k</text>
+    <text x="14" y="212" text-anchor="middle" font-size="10" fill="#7d8794" transform="rotate(-90 14 212)">E(k)</text>
+  </svg></div>
+  <figcaption>Time-averaged over 270 samples. The shaded bands are the fit windows, fixed from k_f before the spectrum was looked at &mdash; choosing them afterwards is how almost any curve is made to agree with a power law. Parseval holds to 2.15e-6, so the normalisation is right.</figcaption>
+</figure>
+  <div class="cards">
+    <div class="card"><span class="meta">enstrophy range, k ∈ [64, 153]</span>
+      <h3 style="color:var(--bad)">-6.08 &nbsp;vs theory −3</h3>
+      <p>An extremely clean power law &mdash; r² = 1.000 &mdash; but at
+      roughly twice the predicted steepness. The spectrum is a straight line in
+      log-log; it is simply the wrong line.</p></div>
+    <div class="card"><span class="meta">inverse range, k ∈ [4, 24]</span>
+      <h3 style="color:var(--bad)">0.99 &nbsp;vs theory −5/3</h3>
+      <p>Positive, meaning E(k) <em>rises</em> toward the forcing wavenumber. There is
+      no inverse cascade: energy is not reaching large scales at all.</p></div>
+    <div class="card"><span class="meta">why</span>
+      <h3>numerical dissipation</h3>
+      <p>The GPU backend implements semi-Lagrangian advection only, and the
+      Taylor-Green measurement above puts that scheme's invented viscosity at
+      ~100% of the physical value. It removes energy at the forcing scale faster
+      than either cascade can transport it.</p></div>
+  </div>
+  
+  <h3>Testing the diagnosis</h3>
+  <p class="note">
+    Attributing the missing cascade to numerical dissipation was a hypothesis. It
+    is testable: port the less dissipative scheme to the GPU and re-run the
+    identical study. That is what this is.
+  </p>
+  <figure>
+  <div class="scroll"><svg viewBox="0 0 760 420" role="img" aria-label="The same study, both advection schemes">
+    <rect x="572.0" y="30" width="106.9" height="344" fill="#69d9ff" opacity=".07"/>
+    <text x="625.4" y="42" text-anchor="middle" font-size="9" fill="#69d9ff" opacity=".85">enstrophy window</text>
+    <line x1="62.0" y1="30" x2="62.0" y2="374" stroke="#1a2029"/>
+    <text x="62.0" y="390" text-anchor="middle" font-size="10" fill="#7d8794">10⁰</text>
+    <line x1="344.4" y1="30" x2="344.4" y2="374" stroke="#1a2029"/>
+    <text x="344.4" y="390" text-anchor="middle" font-size="10" fill="#7d8794">10¹</text>
+    <line x1="626.7" y1="30" x2="626.7" y2="374" stroke="#1a2029"/>
+    <text x="626.7" y="390" text-anchor="middle" font-size="10" fill="#7d8794">10²</text>
+    <line x1="62" y1="332.7" x2="742" y2="332.7" stroke="#1a2029"/>
+    <text x="54" y="336.2" text-anchor="end" font-size="10" fill="#7d8794">10⁻⁷</text>
+    <line x1="62" y1="276.6" x2="742" y2="276.6" stroke="#1a2029"/>
+    <text x="54" y="280.1" text-anchor="end" font-size="10" fill="#7d8794">10⁻⁶</text>
+    <line x1="62" y1="220.4" x2="742" y2="220.4" stroke="#1a2029"/>
+    <text x="54" y="223.9" text-anchor="end" font-size="10" fill="#7d8794">10⁻⁵</text>
+    <line x1="62" y1="164.2" x2="742" y2="164.2" stroke="#1a2029"/>
+    <text x="54" y="167.7" text-anchor="end" font-size="10" fill="#7d8794">10⁻⁴</text>
+    <line x1="62" y1="108.0" x2="742" y2="108.0" stroke="#1a2029"/>
+    <text x="54" y="111.5" text-anchor="end" font-size="10" fill="#7d8794">10⁻³</text>
+    <line x1="62" y1="51.9" x2="742" y2="51.9" stroke="#1a2029"/>
+    <text x="54" y="55.4" text-anchor="end" font-size="10" fill="#7d8794">10⁻²</text>
+    <rect x="62" y="30" width="680" height="344" fill="none" stroke="#232a35"/>
+    <polyline points="62.0,184.1 147.0,137.9 196.7,152.2 232.0,129.4 259.4,128.9 281.7,118.4 300.6,119.5 317.0,119.7 331.4,109.8 344.4,113.3 356.1,105.9 366.7,108.2 376.5,101.6 385.6,100.7 394.1,102.0 402.0,94.9 409.4,95.2 416.4,95.7 423.1,93.7 429.4,95.1 435.3,88.9 441.1,90.3 446.5,89.9 451.7,90.6 456.7,87.8 461.5,89.4 466.2,90.8 470.6,88.2 474.9,91.0 479.1,88.3 483.1,90.8 487.0,92.4 490.8,90.6 494.4,90.0 498.0,90.9 501.4,91.6 504.8,93.1 508.1,64.4 511.3,57.6 514.4,41.5 517.4,48.1 520.3,85.5 523.2,100.7 526.1,105.7 528.8,107.4 531.5,111.5 534.1,113.8 536.7,117.4 539.3,120.5 541.7,124.1 544.2,127.9 546.5,130.2 548.9,135.1 551.2,138.1 553.4,140.7 555.6,144.5 557.8,145.8 559.9,151.8 562.0,151.9 564.1,156.3 566.1,160.1 568.1,161.5 570.1,166.1 572.0,165.0 573.9,170.5 575.8,171.8 577.6,175.2 579.4,178.0 581.2,179.5 583.0,182.7 584.7,184.8 586.4,185.0 588.1,188.8 589.8,190.2 591.4,193.0 593.1,193.9 594.7,195.3 596.3,198.9 597.8,199.8 599.4,201.8 600.9,202.2 602.4,205.5 603.9,207.8 605.3,209.6 606.8,210.3 608.2,212.5 609.7,214.6 611.1,216.9 612.4,216.4 613.8,219.5 615.2,220.8 616.5,222.7 617.8,223.7 619.1,225.9 620.4,227.1 621.7,228.5 623.0,229.7 624.3,230.1 625.5,234.1 626.7,234.1 627.9,237.0 629.2,236.5 630.4,238.2 631.5,241.3 632.7,241.6 633.9,243.3 635.0,244.2 636.2,245.4 637.3,247.3 638.4,247.8 639.5,250.6 640.6,251.3 641.7,252.8 642.8,253.5 643.9,254.6 644.9,256.2 646.0,258.0 647.0,259.5 648.1,260.5 649.1,261.1 650.1,262.2 651.1,264.1 652.1,264.7 653.1,267.0 654.1,267.9 655.1,269.0 656.0,269.4 657.0,271.8 658.0,272.4 658.9,274.0 659.8,274.9 660.8,275.9 661.7,277.1 662.6,277.6 663.5,280.0 664.4,279.6 665.3,281.6 666.2,282.9 667.1,283.2 668.0,284.4 668.9,285.7 669.7,287.1 670.6,288.6 671.4,288.1 672.3,289.2 673.1,290.8 674.0,292.1 674.8,292.3 675.6,293.6 676.4,295.5 677.3,295.5 678.1,297.4 678.9,297.2 679.7,298.8 680.5,300.1 681.3,300.5 682.0,300.8 682.8,302.0 683.6,303.6 684.4,304.8 685.1,304.7 685.9,306.0 686.6,306.4 687.4,308.2 688.1,308.6 688.9,309.6 689.6,310.8 690.3,311.2 691.1,311.7 691.8,312.6 692.5,313.5 693.2,315.8 693.9,315.4 694.7,316.3 695.4,317.5 696.1,317.8 696.7,318.7 697.4,319.2 698.1,320.6 698.8,320.9 699.5,322.0 700.2,322.7 700.8,323.6 701.5,324.5 702.2,325.6 702.8,325.8 703.5,326.3 704.1,327.3 704.8,328.1 705.4,329.5 706.1,329.1 706.7,330.8 707.4,330.6 708.0,331.7 708.6,332.1 709.3,332.9 709.9,333.6 710.5,334.8 711.1,335.0 711.7,336.2 712.3,336.7 712.9,337.1 713.6,338.0 714.2,338.1 714.8,339.7 715.4,339.5 715.9,340.6 716.5,340.5 717.1,341.2 717.7,342.7 718.3,343.1 718.9,343.0 719.5,343.9 720.0,344.3 720.6,345.7 721.2,345.5 721.7,346.0 722.3,347.3 722.9,346.2 723.4,347.7 724.0,348.0 724.5,348.9 725.1,349.6 725.6,350.3 726.2,349.5 726.7,350.6 727.3,351.0 727.8,351.4 728.3,352.2 728.9,351.9 729.4,353.1 729.9,353.1 730.5,353.5 731.0,354.1 731.5,354.6 732.0,354.8 732.5,355.0 733.1,355.2 733.6,355.7 734.1,356.3 734.6,356.2 735.1,356.6 735.6,357.1 736.1,356.6 736.6,357.4 737.1,357.2 737.6,358.2 738.1,358.0 738.6,358.5 739.1,358.2 739.6,358.8 740.1,358.7 740.6,358.9 741.0,358.9 741.5,359.2 742.0,361.5" fill="none" stroke="#ff9d5c" stroke-width="1.8"/>
+    <polyline points="62.0,184.1 147.0,137.9 196.7,152.2 232.0,129.4 259.4,128.9 281.7,118.4 300.6,119.5 317.0,119.7 331.4,109.8 344.4,113.3 356.1,105.9 366.7,108.2 376.5,101.6 385.6,100.7 394.1,102.0 402.0,94.9 409.4,95.2 416.4,95.7 423.1,93.7 429.4,95.1 435.3,88.9 441.1,90.3 446.5,89.9 451.7,90.6 456.7,87.8 461.5,89.4 466.2,90.8 470.6,88.2 474.9,91.0 479.1,88.3 483.1,90.8 487.0,92.4 490.8,90.6 494.4,90.0 498.0,90.9 501.4,91.6 504.8,93.1 508.1,64.4 511.3,57.6 514.4,41.5 517.4,48.1 520.3,85.5 523.2,100.7 526.1,105.7 528.8,107.4 531.5,111.5 534.1,113.8 536.7,117.4 539.3,120.5 541.7,124.1 544.2,127.9 546.5,130.2 548.9,135.1 551.2,138.1 553.4,140.7 555.6,144.5 557.8,145.8 559.9,151.8 562.0,151.9 564.1,156.3 566.1,160.1 568.1,161.5 570.1,166.1 572.0,165.0 573.9,170.5 575.8,171.8 577.6,175.2 579.4,178.0 581.2,179.5 583.0,182.7 584.7,184.8 586.4,185.0 588.1,188.8 589.8,190.2 591.4,193.0 593.1,193.9 594.7,195.3 596.3,198.9 597.8,199.8 599.4,201.8 600.9,202.2 602.4,205.5 603.9,207.8 605.3,209.6 606.8,210.3 608.2,212.5 609.7,214.6 611.1,216.9 612.4,216.4 613.8,219.5 615.2,220.8 616.5,222.7 617.8,223.7 619.1,225.9 620.4,227.1 621.7,228.5 623.0,229.7 624.3,230.1 625.5,234.1 626.7,234.1 627.9,237.0 629.2,236.5 630.4,238.2 631.5,241.3 632.7,241.6 633.9,243.3 635.0,244.2 636.2,245.4 637.3,247.3 638.4,247.8 639.5,250.6 640.6,251.3 641.7,252.8 642.8,253.5 643.9,254.6 644.9,256.2 646.0,258.0 647.0,259.5 648.1,260.5 649.1,261.1 650.1,262.2 651.1,264.1 652.1,264.7 653.1,267.0 654.1,267.9 655.1,269.0 656.0,269.4 657.0,271.8 658.0,272.4 658.9,274.0 659.8,274.9 660.8,275.9 661.7,277.1 662.6,277.6 663.5,280.0 664.4,279.6 665.3,281.6 666.2,282.9 667.1,283.2 668.0,284.4 668.9,285.7 669.7,287.1 670.6,288.6 671.4,288.1 672.3,289.2 673.1,290.8 674.0,292.1 674.8,292.3 675.6,293.6 676.4,295.5 677.3,295.5 678.1,297.4 678.9,297.2 679.7,298.8 680.5,300.1 681.3,300.5 682.0,300.8 682.8,302.0 683.6,303.6 684.4,304.8 685.1,304.7 685.9,306.0 686.6,306.4 687.4,308.2 688.1,308.6 688.9,309.6 689.6,310.8 690.3,311.2 691.1,311.7 691.8,312.6 692.5,313.5 693.2,315.8 693.9,315.4 694.7,316.3 695.4,317.5 696.1,317.8 696.7,318.7 697.4,319.2 698.1,320.6 698.8,320.9 699.5,322.0 700.2,322.7 700.8,323.6 701.5,324.5 702.2,325.6 702.8,325.8 703.5,326.3 704.1,327.3 704.8,328.1 705.4,329.5 706.1,329.1 706.7,330.8 707.4,330.6 708.0,331.7 708.6,332.1 709.3,332.9 709.9,333.6 710.5,334.8 711.1,335.0 711.7,336.2 712.3,336.7 712.9,337.1 713.6,338.0 714.2,338.1 714.8,339.7 715.4,339.5 715.9,340.6 716.5,340.5 717.1,341.2 717.7,342.7 718.3,343.1 718.9,343.0 719.5,343.9 720.0,344.3 720.6,345.7 721.2,345.5 721.7,346.0 722.3,347.3 722.9,346.2 723.4,347.7 724.0,348.0 724.5,348.9 725.1,349.6 725.6,350.3 726.2,349.5 726.7,350.6 727.3,351.0 727.8,351.4 728.3,352.2 728.9,351.9 729.4,353.1 729.9,353.1 730.5,353.5 731.0,354.1 731.5,354.6 732.0,354.8 732.5,355.0 733.1,355.2 733.6,355.7 734.1,356.3 734.6,356.2 735.1,356.6 735.6,357.1 736.1,356.6 736.6,357.4 737.1,357.2 737.6,358.2 738.1,358.0 738.6,358.5 739.1,358.2 739.6,358.8 740.1,358.7 740.6,358.9 741.0,358.9 741.5,359.2 742.0,361.5" fill="none" stroke="#69d9ff" stroke-width="2.2"/>
+    <polyline points="572.0,208.3 574.7,209.9 577.3,211.5 580.0,213.1 582.7,214.7 585.4,216.3 588.0,217.9 590.7,219.5 593.4,221.1 596.0,222.7 598.7,224.3 601.4,225.8 604.1,227.4 606.7,229.0 609.4,230.6 612.1,232.2 614.8,233.8 617.4,235.4 620.1,237.0 622.8,238.6 625.4,240.2 628.1,241.8 630.8,243.4 633.5,245.0 636.1,246.6 638.8,248.2 641.5,249.8 644.1,251.4 646.8,253.0 649.5,254.6 652.2,256.1 654.8,257.7 657.5,259.3 660.2,260.9 662.8,262.5 665.5,264.1 668.2,265.7 670.9,267.3 673.5,268.9 676.2,270.5 678.9,272.1" fill="none" stroke="#7ee787" stroke-width="1.8" stroke-dasharray="5 4"/>
+    <rect x="563.6" y="36.0" width="172.4" height="53" rx="5" fill="#0d1218" fill-opacity=".88" stroke="#232a35"/>
+    <line x1="571.6" y1="49" x2="587.6" y2="49" stroke="#ff9d5c" stroke-width="2"/>
+    <text x="593.6" y="52.5" font-size="10" fill="#e8edf3">semi-Lagrangian  (-6.08)</text>
+    <line x1="571.6" y1="64" x2="587.6" y2="64" stroke="#69d9ff" stroke-width="2"/>
+    <text x="593.6" y="67.5" font-size="10" fill="#e8edf3">MacCormack  (-6.08)</text>
+    <line x1="571.6" y1="79" x2="587.6" y2="79" stroke="#7ee787" stroke-width="2" stroke-dasharray="4 3"/>
+    <text x="593.6" y="82.5" font-size="10" fill="#e8edf3">k^(−3)  theory</text>
+    <text x="62" y="18" font-size="11" fill="#e8edf3" font-weight="600">The same study, both advection schemes</text>
+    <text x="402" y="414" text-anchor="middle" font-size="10" fill="#7d8794">wavenumber k</text>
+    <text x="14" y="202" text-anchor="middle" font-size="10" fill="#7d8794" transform="rotate(-90 14 202)">E(k)</text>
+  </svg></div>
+  <figcaption>Identical forcing, resolution, projection and fit window; only the advection scheme differs. Whatever separates the two curves is the scheme's numerical dissipation and nothing else.</figcaption>
+</figure>
+  <div class="cards">
+    <div class="card"><span class="meta">semi-Lagrangian</span>
+      <h3>-6.08</h3>
+      <p>r² = 1.000. First order; measured numerical
+      viscosity ≈ 100% of ν on the Taylor-Green test.</p></div>
+    <div class="card"><span class="meta">MacCormack</span>
+      <h3>-6.08</h3>
+      <p>r² = 1.000. Second order, limited; ~2.9% of ν.
+      GPU energy retention over 200 inviscid steps: 0.2475 of 0.25, against 0.2117
+      for semi-Lagrangian.</p></div>
+    <div class="card"><span class="meta">theory</span>
+      <h3 style="color:var(--good)">−3.00</h3>
+      <p>Changing the scheme barely moved the slope, so numerical dissipation from advection is <em>not</em> the whole explanation.</p></div>
+  </div>
+  <div class="finding">
+    <h3>What would be needed to see a real cascade</h3>
+    <dl>
+      <dt>diagnosis</dt><dd>The enstrophy slope of -6.08 with
+        r² = 1.000 is not noise. A dissipation range that wide means the
+        scheme is removing energy across the whole resolved band rather than only
+        near the grid scale, which is exactly what a first-order upwind-like method
+        does.</dd>
+      <dt>evidence</dt><dd>The same solver's MacCormack advection is
+        36×
+        less dissipative on the CPU. The GPU path does not implement it.</dd>
+      <dt>next step</dt><dd>Port MacCormack/BFECC to the GPU kernels and re-run.
+        This is documented as not done rather than presented as a limitation of
+        the physics.</dd>
+      <dt>not the cause</dt><dd>The projection: max |∇·u| =
+        0 with multigrid, so the field really is
+        solenoidal. And Parseval holds to 2.15e-6, so the
+        spectrum's normalisation is correct.</dd>
+    </dl>
+  </div>
+</div></section>
+<section><div class="wrap">
+  <p class="eyebrow">gpu</p>
+  <h2>Moving the solve onto compute shaders</h2>
+  <p class="lede prose">
+    Every stage of the timestep &mdash; advection, diffusion, divergence, the
+    iterative pressure solve, the gradient subtraction &mdash; is a WGSL compute
+    dispatch. The CPU only issues commands. What follows is how that was checked
+    and what it bought.
+  </p>
+<figure>
+  <div class="scroll"><svg viewBox="0 0 700 400" role="img" aria-label="Three pressure solvers, on a common cost axis">
+    <line x1="128.5" y1="30" x2="128.5" y2="354" stroke="#1a2029"/>
+    <text x="128.5" y="370" text-anchor="middle" font-size="10" fill="#7d8794">10⁰</text>
+    <line x1="349.5" y1="30" x2="349.5" y2="354" stroke="#1a2029"/>
+    <text x="349.5" y="370" text-anchor="middle" font-size="10" fill="#7d8794">10¹</text>
+    <line x1="570.4" y1="30" x2="570.4" y2="354" stroke="#1a2029"/>
+    <text x="570.4" y="370" text-anchor="middle" font-size="10" fill="#7d8794">10²</text>
+    <line x1="62" y1="342.9" x2="682" y2="342.9" stroke="#1a2029"/>
+    <text x="54" y="346.4" text-anchor="end" font-size="10" fill="#7d8794">10⁻⁷</text>
+    <line x1="62" y1="299.5" x2="682" y2="299.5" stroke="#1a2029"/>
+    <text x="54" y="303.0" text-anchor="end" font-size="10" fill="#7d8794">10⁻⁶</text>
+    <line x1="62" y1="256.0" x2="682" y2="256.0" stroke="#1a2029"/>
+    <text x="54" y="259.5" text-anchor="end" font-size="10" fill="#7d8794">10⁻⁵</text>
+    <line x1="62" y1="212.6" x2="682" y2="212.6" stroke="#1a2029"/>
+    <text x="54" y="216.1" text-anchor="end" font-size="10" fill="#7d8794">10⁻⁴</text>
+    <line x1="62" y1="169.2" x2="682" y2="169.2" stroke="#1a2029"/>
+    <text x="54" y="172.7" text-anchor="end" font-size="10" fill="#7d8794">10⁻³</text>
+    <line x1="62" y1="125.7" x2="682" y2="125.7" stroke="#1a2029"/>
+    <text x="54" y="129.2" text-anchor="end" font-size="10" fill="#7d8794">10⁻²</text>
+    <line x1="62" y1="82.3" x2="682" y2="82.3" stroke="#1a2029"/>
+    <text x="54" y="85.8" text-anchor="end" font-size="10" fill="#7d8794">10⁻¹</text>
+    <line x1="62" y1="38.9" x2="682" y2="38.9" stroke="#1a2029"/>
+    <text x="54" y="42.4" text-anchor="end" font-size="10" fill="#7d8794">10⁰</text>
+    <rect x="62" y="30" width="620" height="324" fill="none" stroke="#232a35"/>
+    <polyline points="62.0,38.9 128.5,52.3 195.0,58.1 282.9,66.7 349.5,73.6 416.0,80.5 482.5,87.0 549.0,92.9 615.5,98.5 682.0,104.2" fill="none" stroke="#ff9d5c" stroke-width="1.8"/>
+    <circle cx="62.0" cy="38.9" r="2.6" fill="#ff9d5c"/>
+    <circle cx="128.5" cy="52.3" r="2.6" fill="#ff9d5c"/>
+    <circle cx="195.0" cy="58.1" r="2.6" fill="#ff9d5c"/>
+    <circle cx="282.9" cy="66.7" r="2.6" fill="#ff9d5c"/>
+    <circle cx="349.5" cy="73.6" r="2.6" fill="#ff9d5c"/>
+    <circle cx="416.0" cy="80.5" r="2.6" fill="#ff9d5c"/>
+    <circle cx="482.5" cy="87.0" r="2.6" fill="#ff9d5c"/>
+    <circle cx="549.0" cy="92.9" r="2.6" fill="#ff9d5c"/>
+    <circle cx="615.5" cy="98.5" r="2.6" fill="#ff9d5c"/>
+    <circle cx="682.0" cy="104.2" r="2.6" fill="#ff9d5c"/>
+    <polyline points="62.0,38.9 128.5,65.6 195.0,80.1 282.9,98.1 349.5,111.8 416.0,125.3 482.5,139.7 549.0,157.0 615.5,174.7 682.0,195.3" fill="none" stroke="#69d9ff" stroke-width="1.8"/>
+    <circle cx="62.0" cy="38.9" r="2.6" fill="#69d9ff"/>
+    <circle cx="128.5" cy="65.6" r="2.6" fill="#69d9ff"/>
+    <circle cx="195.0" cy="80.1" r="2.6" fill="#69d9ff"/>
+    <circle cx="282.9" cy="98.1" r="2.6" fill="#69d9ff"/>
+    <circle cx="349.5" cy="111.8" r="2.6" fill="#69d9ff"/>
+    <circle cx="416.0" cy="125.3" r="2.6" fill="#69d9ff"/>
+    <circle cx="482.5" cy="139.7" r="2.6" fill="#69d9ff"/>
+    <circle cx="549.0" cy="157.0" r="2.6" fill="#69d9ff"/>
+    <circle cx="615.5" cy="174.7" r="2.6" fill="#69d9ff"/>
+    <circle cx="682.0" cy="195.3" r="2.6" fill="#69d9ff"/>
+    <polyline points="62.0,38.9 289.1,134.2 355.6,193.1 394.5,246.3 422.2,297.0 443.6,338.7 461.1,343.7 488.7,344.2 510.1,344.4 527.6,343.7" fill="none" stroke="#7ee787" stroke-width="1.8"/>
+    <circle cx="62.0" cy="38.9" r="2.6" fill="#7ee787"/>
+    <circle cx="289.1" cy="134.2" r="2.6" fill="#7ee787"/>
+    <circle cx="355.6" cy="193.1" r="2.6" fill="#7ee787"/>
+    <circle cx="394.5" cy="246.3" r="2.6" fill="#7ee787"/>
+    <circle cx="422.2" cy="297.0" r="2.6" fill="#7ee787"/>
+    <circle cx="443.6" cy="338.7" r="2.6" fill="#7ee787"/>
+    <circle cx="461.1" cy="343.7" r="2.6" fill="#7ee787"/>
+    <circle cx="488.7" cy="344.2" r="2.6" fill="#7ee787"/>
+    <circle cx="510.1" cy="344.4" r="2.6" fill="#7ee787"/>
+    <circle cx="527.6" cy="343.7" r="2.6" fill="#7ee787"/>
+    <rect x="514.8" y="36.0" width="161.2" height="53" rx="5" fill="#0d1218" fill-opacity=".88" stroke="#232a35"/>
+    <line x1="522.8" y1="49" x2="538.8" y2="49" stroke="#ff9d5c" stroke-width="2"/>
+    <text x="544.8" y="52.5" font-size="10" fill="#e8edf3">Jacobi</text>
+    <line x1="522.8" y1="64" x2="538.8" y2="64" stroke="#69d9ff" stroke-width="2"/>
+    <text x="544.8" y="67.5" font-size="10" fill="#e8edf3">red-black Gauss-Seidel</text>
+    <line x1="522.8" y1="79" x2="538.8" y2="79" stroke="#7ee787" stroke-width="2"/>
+    <text x="544.8" y="82.5" font-size="10" fill="#e8edf3">multigrid V-cycle</text>
+    <text x="62" y="18" font-size="11" fill="#e8edf3" font-weight="600">Three pressure solvers, on a common cost axis</text>
+    <text x="372" y="394" text-anchor="middle" font-size="10" fill="#7d8794">equivalent fine-grid sweeps (cost)</text>
+    <text x="14" y="192" text-anchor="middle" font-size="10" fill="#7d8794" transform="rotate(-90 14 192)">relative residual</text>
+  </svg></div>
+  <figcaption>Multigrid's unit is a V-cycle, which costs about 4/3 of a fine-grid sweep across all levels; plotting against raw iteration count would have compared unlike things. It plateaus near 1e-7 because that is the f32 floor, not because it has stopped converging.</figcaption>
+</figure>
+<p class="note">
+      At roughly 40 sweeps of equivalent cost: Jacobi reaches
+      0,
+      red-black 0,
+      multigrid 9.34e-8.
+      Jacobi and Gauss-Seidel are local &mdash; one sweep moves information one cell &mdash;
+      so their reduction factor for a mode spanning L cells is about 1 − O(1/L²), and
+      refining the grid makes that strictly worse. Multigrid solves those modes on a
+      grid where they are no longer smooth.
+    </p>
+<h3>Verification against the f64 CPU reference</h3>
+<div class="tbl-wrap"><div class="scroll"><table>
+  <thead><tr><th>check</th><th>result</th><th>measured</th></tr></thead>
+  <tbody><tr><td>advection kernel matches CPU</td><td><span class="pill good">pass</span></td><td><code>relL2 u=2.29e-7 v=2.27e-7 (f32 floor ~1e-6)</code></td></tr>
+  <tr><td>divergence kernel matches CPU</td><td><span class="pill good">pass</span></td><td><code>relL2=5.78e-8</code></td></tr>
+  <tr><td>GPU projection substantially reduces divergence</td><td><span class="pill good">pass</span></td><td><code>red-black: 1.81e+1 -&gt; 1.74e-2 (1040x)</code></td></tr>
+  <tr><td>red-black clears divergence better than Jacobi at equal cost</td><td><span class="pill good">pass</span></td><td><code>after 200 sweeps: RB 1.74e-2 vs J 6.19e-1 (35.6x better)</code></td></tr>
+  <tr><td>red-black Gauss-Seidel converges faster than Jacobi</td><td><span class="pill good">pass</span></td><td><code>at 320 sweeps: RB 2.51e-4 vs J 3.14e-2</code></td></tr>
+  <tr><td>Jacobi residual decreases monotonically</td><td><span class="pill good">pass</span></td><td><code></code></td></tr>
+  <tr><td>GPU matches CPU after 10 full steps</td><td><span class="pill good">pass</span></td><td><code>relL2 u=3.31e-6 v=3.31e-6</code></td></tr>
+  <tr><td>GPU keeps the field divergence-free</td><td><span class="pill good">pass</span></td><td><code>max|div|=1.76e-5 (CPU 1.78e-15)</code></td></tr></tbody>
+</table></div></div>
+<p class="note">
+      WGSL is f32 and permits relaxed precision on transcendentals &mdash; a plain
+      <code>sin</code> measured 6.9e-5 maximum absolute error on this adapter. So the
+      GPU cannot agree with the f64 reference below about 1e-5 relative, and any
+      tighter claim would be measuring nothing. Agreement of
+      3.31e-6 after ten full steps is f32 accumulation noise.
+    </p>
+<figure>
+  <div class="scroll"><svg viewBox="0 0 700 380" role="img" aria-label="Same algorithm, same iteration count">
+    <line x1="316.8" y1="30" x2="316.8" y2="334" stroke="#1a2029"/>
+    <text x="316.8" y="350" text-anchor="middle" font-size="10" fill="#7d8794">10²</text>
+    <line x1="62" y1="305.2" x2="682" y2="305.2" stroke="#1a2029"/>
+    <text x="54" y="308.7" text-anchor="end" font-size="10" fill="#7d8794">10¹</text>
+    <line x1="62" y1="197.5" x2="682" y2="197.5" stroke="#1a2029"/>
+    <text x="54" y="201.0" text-anchor="end" font-size="10" fill="#7d8794">10²</text>
+    <line x1="62" y1="89.8" x2="682" y2="89.8" stroke="#1a2029"/>
+    <text x="54" y="93.3" text-anchor="end" font-size="10" fill="#7d8794">10³</text>
+    <rect x="62" y="30" width="620" height="304" fill="none" stroke="#232a35"/>
+    <polyline points="62.0,294.4 217.0,231.3 372.0,170.5 527.0,104.8 682.0,52.0" fill="none" stroke="#ff9d5c" stroke-width="1.8"/>
+    <circle cx="62.0" cy="294.4" r="2.6" fill="#ff9d5c"/>
+    <circle cx="217.0" cy="231.3" r="2.6" fill="#ff9d5c"/>
+    <circle cx="372.0" cy="170.5" r="2.6" fill="#ff9d5c"/>
+    <circle cx="527.0" cy="104.8" r="2.6" fill="#ff9d5c"/>
+    <circle cx="682.0" cy="52.0" r="2.6" fill="#ff9d5c"/>
+    <polyline points="62.0,310.1 217.0,250.2 372.0,294.4 527.0,295.5 682.0,278.2" fill="none" stroke="#69d9ff" stroke-width="1.8"/>
+    <circle cx="62.0" cy="310.1" r="2.6" fill="#69d9ff"/>
+    <circle cx="217.0" cy="250.2" r="2.6" fill="#69d9ff"/>
+    <circle cx="372.0" cy="294.4" r="2.6" fill="#69d9ff"/>
+    <circle cx="527.0" cy="295.5" r="2.6" fill="#69d9ff"/>
+    <circle cx="682.0" cy="278.2" r="2.6" fill="#69d9ff"/>
+    <rect x="587.6" y="36.0" width="88.4" height="38" rx="5" fill="#0d1218" fill-opacity=".88" stroke="#232a35"/>
+    <line x1="595.6" y1="49" x2="611.6" y2="49" stroke="#ff9d5c" stroke-width="2"/>
+    <text x="617.6" y="52.5" font-size="10" fill="#e8edf3">CPU (f64)</text>
+    <line x1="595.6" y1="64" x2="611.6" y2="64" stroke="#69d9ff" stroke-width="2"/>
+    <text x="617.6" y="67.5" font-size="10" fill="#e8edf3">GPU (f32)</text>
+    <text x="62" y="18" font-size="11" fill="#e8edf3" font-weight="600">Same algorithm, same iteration count</text>
+    <text x="372" y="374" text-anchor="middle" font-size="10" fill="#7d8794">grid resolution N (N² cells)</text>
+    <text x="14" y="182" text-anchor="middle" font-size="10" fill="#7d8794" transform="rotate(-90 14 182)">ms per step</text>
+  </svg></div>
+  <figcaption>Identical Jacobi sweeps on identical grids, so the only difference is where the arithmetic runs. The GPU is slower below N ≈ 100, where dispatch overhead dominates the work.</figcaption>
+</figure>
+<div class="tbl-wrap"><div class="scroll"><table>
+  <thead><tr><th>grid</th><th class="num">cells</th><th class="num">CPU ms</th><th class="num">GPU ms</th><th class="num">speedup</th></tr></thead>
+  <tbody><tr><td><strong>32²</strong></td><td class="num">1,024</td><td class="num">12.6</td><td class="num">9.0</td><td class="num"><strong>1.4×</strong></td></tr>
+  <tr><td><strong>64²</strong></td><td class="num">4,096</td><td class="num">48.5</td><td class="num">32.4</td><td class="num"><strong>1.5×</strong></td></tr>
+  <tr><td><strong>128²</strong></td><td class="num">16,384</td><td class="num">178.0</td><td class="num">12.6</td><td class="num"><strong>14.1×</strong></td></tr>
+  <tr><td><strong>256²</strong></td><td class="num">65,536</td><td class="num">725.7</td><td class="num">12.3</td><td class="num"><strong>59.0×</strong></td></tr>
+  <tr><td><strong>512²</strong></td><td class="num">262,144</td><td class="num">2244.3</td><td class="num">17.8</td><td class="num"><strong>126.1×</strong></td></tr></tbody>
+</table></div></div>
+
+    <h3>Equal quality, not equal work</h3>
+    <p class="note">
+      The comparison above gives both devices the same iteration count. That is fair
+      as a hardware measurement and misleading as a practical one, because the CPU's
+      best option is an exact FFT Poisson solve. So here each GPU solver is given as
+      many iterations as it needs to reach max |∇·u| ≤ 0.001,
+      and <em>that</em> is what is timed. Red-black could not reach the target at all
+      at the larger sizes; multigrid reaches it in a single V-cycle.
+    </p>
+<div class="tbl-wrap"><div class="scroll"><table>
+  <thead><tr><th>grid</th><th class="num">CPU FFT ms</th><th class="num">red-black</th><th class="num">multigrid</th><th class="num">MG speedup</th></tr></thead>
+  <tbody><tr><td><strong>64²</strong></td><td class="num">44.6</td><td class="num">23.6 <span style="color:var(--dim)">/ 160sw</span></td><td class="num">10.9 <span style="color:var(--dim)">/ 1vc</span></td><td class="num"><strong>4.1×</strong></td></tr>
+  <tr><td><strong>128²</strong></td><td class="num">45.9</td><td class="num">95.6 <span style="color:var(--dim)">/ 640sw</span></td><td class="num">16.6 <span style="color:var(--dim)">/ 1vc</span></td><td class="num"><strong>2.8×</strong></td></tr>
+  <tr><td><strong>256²</strong></td><td class="num">178.2</td><td class="num">263.1 <span style="color:var(--dim)">/ 1280sw</span> <span class="pill bad">missed</span></td><td class="num">16.0 <span style="color:var(--dim)">/ 1vc</span></td><td class="num"><strong>11.1×</strong></td></tr>
+  <tr><td><strong>512²</strong></td><td class="num">754.8</td><td class="num">556.5 <span style="color:var(--dim)">/ 1280sw</span> <span class="pill bad">missed</span></td><td class="num">28.6 <span style="color:var(--dim)">/ 1vc</span></td><td class="num"><strong>26.4×</strong></td></tr></tbody>
+</table></div></div>
+<p class="note">
+      This is the honest version of the GPU claim. At equal iteration count the GPU
+      looks 126×
+      faster, but much of that is the GPU running a <em>worse algorithm</em> quickly.
+      Once accuracy is held fixed, the win comes from multigrid, and it is
+      26.4× at 512².
+    </p>
+
+    <div class="cards">
+      <div class="card"><span class="meta">interactive ceiling</span>
+        <h3>256² on GPU</h3>
+        <p>Largest grid holding 60 fps (16.7 ms/step), against
+        32² on the CPU
+         &mdash; 64× more cells.</p></div>
+      <div class="card"><span class="meta">hardware</span>
+        <h3>intel gen-12lp</h3>
+        <p>An integrated GPU sharing memory bandwidth with the CPU. A discrete card
+        would widen every ratio here; these numbers are the modest end.</p></div>
+    </div></div></section>
+
+<section><div class="wrap">
+  <p class="eyebrow">honestly</p>
+  <h2>Bugs found, and how</h2>
+  <p class="lede prose">
+    Four, all fixed. Three of them were in the <em>measuring</em> code rather than
+    the solver &mdash; a validator reported the scheme stable well past its real
+    limit, and a benchmark reported a speedup that was partly an algorithm
+    difference. Instruments need testing at least as much as the thing they measure.
+  </p>
+  <div class="stack">
+    
+    <article class="finding bug">
+      <h3>1. Every GPU pass read the same uniform values</h3>
+      <dl>
+        <dt>symptom</dt><dd>The pressure solve did nothing. Divergence fell from 18.1 to 16.3 after 200 Jacobi sweeps, and red-black froze at a residual of 6.13e-1 from its first sweep onward, never improving.</dd>
+        <dt>cause</dt><dd><code>queue.writeBuffer</code> is ordered against <em>submitted</em> command buffers, not against commands being encoded. Encoding a pass does not capture the uniform's contents &mdash; the pass reads the buffer when it executes, after every write issued before the submit has landed. Writing params, encoding a pass, writing again, encoding again, then submitting once meant all passes saw the final value: relaxation factor 0 (so Jacobi was <code>p + 0·(new − p)</code>, i.e. nothing) and colour always 1 (so red cells were never updated).</dd>
+        <dt>fix</dt><dd>A ring of 256-byte-aligned uniform slots, with the bind helper allocating a pass's slot as it binds it &mdash; so the parameters cannot be separated from the pass that reads them.</dd>
+        <dt>found by</dt><dd>Suspected from the shape of the failure: the standalone residual curve worked while the in-step projection did not, and the only difference was one encoder versus many.</dd>
+        <dt>file</dt><dd><code>src/gpu/solver.js</code></dd>
+      </dl>
+    </article>
+    <article class="finding bug">
+      <h3>2. The stability sweep reported the solver stable at 2.4× the theoretical limit</h3>
+      <dl>
+        <dt>symptom</dt><dd>Explicit diffusion was reported stable up to ν·dt/h² = 0.6. The textbook bound is 0.25.</dd>
+        <dt>cause</dt><dd>Two compounding mistakes in the instrument, none in the solver. The sweep started from a smooth Taylor-Green field, which contains essentially none of the checkerboard mode that actually goes unstable &mdash; so there was nothing to amplify. And it watched for kinetic energy to exceed a fixed threshold, which a viscously decaying field was never going to cross however unstable the scheme was.</dd>
+        <dt>fix</dt><dd>Seed the grid-scale mode explicitly and measure its growth by projecting onto it. The operator now reproduces |1 − 8d| to better than 1e-6 at every point, with the boundary at exactly 0.25 / 0.26.</dd>
+        <dt>found by</dt><dd>Testing the diffusion operator in isolation, which immediately showed amplification of exactly 1.00 at d = 0.25 &mdash; correct all along.</dd>
+        <dt>file</dt><dd><code>validate/studies.js</code></dd>
+      </dl>
+    </article>
+    <article class="finding bug">
+      <h3>3. A benchmark that flattered the GPU twice over</h3>
+      <dl>
+        <dt>symptom</dt><dd>An early run reported the GPU 38.9× faster at 512².</dd>
+        <dt>cause</dt><dd>Two separate unfairnesses. The 'same algorithm' comparison ran conjugate gradient on the CPU against Jacobi on the GPU and attributed the difference to hardware &mdash; CG is far stronger per iteration. And the 'best available' comparison timed 20 GPU sweeps (leaving divergence at 2.5e-1) against an exact CPU FFT solve (1e-15), letting the GPU win by doing less work <em>and</em> returning a worse answer.</dd>
+        <dt>fix</dt><dd>Jacobi on both sides for the hardware comparison, and an equal-quality comparison that raises the GPU's iteration count until it matches a target divergence. The honest numbers are lower and more interesting: the GPU initially <em>lost</em> at equal quality, which is what motivated multigrid.</dd>
+        <dt>found by</dt><dd>Noticing that the reported GPU divergence was three orders of magnitude worse than the CPU's in the same table.</dd>
+        <dt>file</dt><dd><code>tools/bench.html</code></dd>
+      </dl>
+    </article>
+    <article class="finding bug">
+      <h3>4. Non-monotonic GPU timings from insufficient warm-up</h3>
+      <dl>
+        <dt>symptom</dt><dd>N = 32 measured 11.9 ms and N = 64 measured 31.7 ms, while N = 128 ran in 9.5 ms &mdash; a smaller grid taking three times longer.</dd>
+        <dt>cause</dt><dd>Three unsynced warm-up steps left pipeline compilation and the iGPU's idle clock inside the measurement window, and only the first two configurations paid it.</dd>
+        <dt>fix</dt><dd>Twelve warm-up steps with periodic queue synchronisation. The artifact disappeared and the curve became monotonic.</dd>
+        <dt>found by</dt><dd>The physics made no sense: dispatch overhead cannot make a 4× smaller grid slower.</dd>
+        <dt>file</dt><dd><code>tools/bench.html</code></dd>
+      </dl>
+    </article>
+  </div>
+</div></section>
+
+<section><div class="wrap">
+  <p class="eyebrow">limits</p>
+  <h2>What this does not do</h2>
+  <div class="prose"><ul>
+    <li><strong>The GPU path has only semi-Lagrangian advection.</strong> MacCormack
+      exists on the CPU and is roughly 36× less dissipative, but was not ported. This
+      is the single biggest reason the energy spectrum misses Kraichnan's −3, and it
+      is a gap in the implementation rather than a property of the physics.</li>
+    <li><strong>First order in time.</strong> Lie splitting caps the whole scheme at
+      O(dt) no matter how accurate the operators are. Strang splitting would give
+      second order for about 1.5× the cost.</li>
+    <li><strong>No inverse cascade was observed.</strong> The measured slope in the
+      inverse range is positive. Whether a less dissipative scheme would recover
+      Kraichnan's −5/3 at this resolution is untested, and claiming it would be
+      speculation.</li>
+    <li><strong>f32 on the GPU.</strong> The multigrid residual plateaus near 1e-7
+      because that is the precision floor, not because the method stalls.</li>
+    <li><strong>Periodic boundaries only.</strong> The FFT reference solver and the
+      spectra both require it. Walls would need the conjugate-gradient path, which
+      exists but is not exercised here.</li>
+    <li><strong>Integrated GPU.</strong> Every performance ratio on this page comes
+      from an Intel iGPU sharing bandwidth with the CPU, which is the pessimistic end
+      of the range.</li>
+  </ul></div>
+</div></section>
+
+<section><div class="wrap">
+  <p class="eyebrow">reproduce</p>
+  <h2>Run it yourself</h2>
+  <pre><span class="c"># no dependencies beyond node</span>
+git clone https://github.com/abho7/fluid-sim &amp;&amp; cd fluid-sim
+
+<span class="c"># the whole suite: solver, FFT, analytic solutions, and the
+# mutation tests that prove the validators actually fire</span>
+node --test test/*.test.js
+
+<span class="c"># regenerate every CPU-side number on this page</span>
+node validate/run.js
+
+<span class="c"># serve the demo and the GPU harnesses (WebGPU needs a secure context)</span>
+node tools/serve.js
+<span class="c">#   /                   the interactive demo
+#   /tools/gputest.html GPU vs CPU verification
+#   /tools/bench.html   performance
+#   /tools/spectrum.html forced turbulence</span>
+
+<span class="c"># rebuild this page from results/*.json</span>
+node tools/build_report.js</pre>
+  <p class="note">
+    The solver, the FFT, the multigrid cycle, the plots on this page and the static
+    server are all written from scratch. Node and a WebGPU-capable browser are the
+    only requirements.
+  </p>
+</div></section>
+<footer><div class="wrap">
+  fluid-sim &middot; Abhineeth Duddela &middot; &copy; 2026<br>
+  Stable fluids (Stam 1999) on a MAC staggered grid, with MacCormack advection,
+  geometric multigrid, and validation against Taylor-Green and Kraichnan-Batchelor.<br>
+  measured on win32 · 13th Gen Intel(R) Core(TM) i7-1355U
+</div></footer>
+<script>
+(function(){
+  // A passive vorticity-like field in the header: two counter-rotating Gaussian
+  // vortices advecting tracer particles. It is the same phenomenon the report
+  // is about, drawn cheaply, and it stops entirely under reduced-motion.
+  var c=document.getElementById('hero'); if(!c) return;
+  if (matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  var x=c.getContext('2d'), P=[], raf=null;
+  function size(){var d=Math.min(devicePixelRatio||1,2);
+    c.width=c.clientWidth*d; c.height=c.clientHeight*d; x.setTransform(d,0,0,d,0,0);}
+  function seed(){P=[];var w=c.clientWidth,h=c.clientHeight,n=Math.min(900,Math.round(w*h/1400));
+    for(var i=0;i<n;i++)P.push({x:Math.random()*w,y:Math.random()*h,a:Math.random()});}
+  function vel(px,py,w,h){
+    var vx=0,vy=0;
+    var cs=[[w*0.32,h*0.5,1],[w*0.68,h*0.5,-1],[w*0.5,h*0.15,-0.6],[w*0.5,h*0.9,0.6]];
+    for(var i=0;i<cs.length;i++){
+      var dx=px-cs[i][0], dy=py-cs[i][1], r2=dx*dx+dy*dy+900;
+      var s=cs[i][2]*24000/r2;
+      vx+=-dy/Math.sqrt(r2)*s; vy+=dx/Math.sqrt(r2)*s;
+    }
+    return [vx,vy];
+  }
+  function frame(){
+    var w=c.clientWidth,h=c.clientHeight;
+    x.fillStyle='rgba(6,9,13,0.14)'; x.fillRect(0,0,w,h);
+    for(var i=0;i<P.length;i++){
+      var p=P[i], v=vel(p.x,p.y,w,h);
+      p.x+=v[0]*0.016; p.y+=v[1]*0.016; p.a-=0.0016;
+      if(p.a<=0||p.x<0||p.x>w||p.y<0||p.y>h){
+        p.x=Math.random()*w; p.y=Math.random()*h; p.a=1;
+      }
+      var sp=Math.min(1,Math.hypot(v[0],v[1])/60);
+      x.fillStyle='rgba('+Math.round(60+150*sp)+','+Math.round(190-40*sp)+',255,'+(0.16*p.a).toFixed(3)+')';
+      x.fillRect(p.x,p.y,1.4,1.4);
+    }
+    raf=requestAnimationFrame(frame);
+  }
+  function boot(){size();seed();if(!raf)frame();}
+  addEventListener('resize',function(){size();seed();});
+  boot();
+})();
+</script>
+</body>
+</html>

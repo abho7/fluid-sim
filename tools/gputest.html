@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>GPU verification harness</title>
+<style>
+  body { background:#0b0c10; color:#d8dee9; font:13px ui-monospace,Consolas,monospace;
+         margin:0; padding:1.5rem; }
+  pre { white-space:pre-wrap; line-height:1.6; }
+  .ok { color:#8fd694 } .bad { color:#f2777a } .warn { color:#ffcc66 }
+  h1 { font-size:1rem; letter-spacing:.1em; text-transform:uppercase; color:#8ab4f8 }
+</style>
+</head>
+<body>
+<h1>GPU verification harness</h1>
+<pre id="out">running…</pre>
+
+<script type="module">
+/**
+ * Phase 3 gate, run in a real browser because that is the only place WebGPU
+ * exists here.
+ *
+ * The GPU solver is checked against the CPU reference field by field on
+ * identical inputs. It cannot match to f64 precision -- WGSL is f32 with
+ * relaxed transcendentals (a plain sin was measured at 6.9e-5 error on this
+ * adapter) -- so the target is ~1e-4 relative after several steps, which is
+ * what f32 accumulation through a stencil actually delivers. A tighter claim
+ * would be measuring nothing.
+ *
+ * Results are written to window.__RESULTS__ so the automation can read them.
+ */
+import { Grid, maxDivergence, divergence } from "../src/core/grid.js";
+import { taylorGreen } from "../src/core/analytic.js";
+import { FluidSolver } from "../src/cpu/solver.js";
+import { createDevice, GPUFluidSolver } from "../src/gpu/solver.js";
+
+const out = document.getElementById("out");
+const lines = [];
+const log = (s, cls) => {
+  lines.push(cls ? `<span class="${cls}">${s}</span>` : s);
+  out.innerHTML = lines.join("\n");
+};
+
+const R = { checks: [], errors: [] };
+window.__RESULTS__ = R;
+
+function check(name, pass, detail) {
+  R.checks.push({ name, pass, detail });
+  log(`${pass ? "PASS" : "FAIL"}  ${name}  ${detail ?? ""}`, pass ? "ok" : "bad");
+  return pass;
+}
+
+function relDiff(a, b) {
+  let num = 0, den = 0;
+  for (let i = 0; i < a.length; i++) {
+    const d = a[i] - b[i];
+    num += d * d;
+    den += b[i] * b[i];
+  }
+  return Math.sqrt(num / (den || 1));
+}
+
+async function main() {
+  const { device, hasTimestamps, info, adapter } = await createDevice();
+  R.adapter = info;
+  R.hasTimestamps = hasTimestamps;
+  R.limits = { maxTextureDimension2D: adapter.limits.maxTextureDimension2D };
+  log(`adapter: ${JSON.stringify(info)}`);
+  log(`timestamps: ${hasTimestamps}\n`);
+
+  const N = 64, nu = 0.0, dt = 0.01;
+
+  // ---------------------------------------------------------------- 1. advection
+  // One advection step, no pressure, no viscosity. Isolates the semi-Lagrangian
+  // kernel and its sampling arithmetic -- this is where a half-cell MAC offset
+  // between CPU and GPU would show up, and nowhere else is it so visible.
+  {
+    const g = new Grid(N, N);
+    const [u0, v0] = taylorGreen.init(g, g.u(), g.v(), 0, nu);
+
+    const cpu = new FluidSolver({ n: N, nu: 0, validation: true, projection: "fft" });
+    cpu.u.set(u0); cpu.v.set(v0);
+    // Advection only, matching what the GPU kernel does in isolation.
+    cpu.scheme.velocity(cpu.g, cpu.u, cpu.v, cpu._tu, cpu._tv, dt, cpu._scratch);
+
+    const gpu = new GPUFluidSolver(device, { n: N, nu: 0, pressureIterations: 0,
+      advection: "semi-lagrangian", hasTimestamps });
+    gpu.uploadVelocity(u0, v0);
+    // Advect only: run the velocity-advection dispatch by itself.
+    const enc = device.createCommandEncoder();
+    gpu._resetSlots();
+    const pass = enc.beginComputePass();
+    gpu._dispatch(pass, gpu.pipe.advectVel, gpu._bind(gpu.pipe.advectVel, { dt }, [
+      { binding: 1, resource: gpu.velCur.createView() },
+      { binding: 2, resource: gpu.velNext.createView() },
+    ]));
+    pass.end();
+    device.queue.submit([enc.finish()]);
+    gpu._swapVel();
+
+    const { u, v } = await gpu.readVelocity();
+    const du = relDiff(u, cpu._tu), dv = relDiff(v, cpu._tv);
+    check("advection kernel matches CPU", Math.max(du, dv) < 2e-5,
+      `relL2 u=${du.toExponential(2)} v=${dv.toExponential(2)} (f32 floor ~1e-6)`);
+    R.advection = { du, dv };
+    gpu.destroy();
+  }
+
+  // ---------------------------------------------------------------- 2. divergence
+  {
+    const g = new Grid(N, N);
+    let s = 991;
+    const rnd = () => { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff - 0.5; };
+    const u0 = g.u(), v0 = g.v();
+    for (let i = 0; i < u0.length; i++) { u0[i] = rnd(); v0[i] = rnd(); }
+    const dCpu = divergence(g, u0, v0);
+
+    const gpu = new GPUFluidSolver(device, { n: N, nu: 0, hasTimestamps });
+    gpu.uploadVelocity(u0, v0);
+    const enc = device.createCommandEncoder();
+    gpu._resetSlots();
+    const pass = enc.beginComputePass();
+    gpu._dispatch(pass, gpu.pipe.divergence, gpu._bind(gpu.pipe.divergence, { dt: 0 }, [
+      { binding: 1, resource: gpu.velCur.createView() },
+      { binding: 2, resource: gpu.div.createView() },
+    ]));
+    pass.end();
+    device.queue.submit([enc.finish()]);
+
+    const raw = await gpu.readTexture(gpu.div);
+    const dGpu = new Float32Array(N * N);
+    for (let i = 0; i < N * N; i++) dGpu[i] = raw[i * 4];
+    const dd = relDiff(dGpu, dCpu);
+    check("divergence kernel matches CPU", dd < 1e-5, `relL2=${dd.toExponential(2)}`);
+    R.divergence = dd;
+    gpu.destroy();
+  }
+
+  // ---------------------------------------------- 3. projection actually projects
+  //
+  // Both solvers get the SAME iteration budget on the SAME field, because the
+  // interesting quantity is the contrast, not an absolute threshold.
+  //
+  // An earlier version of this check ran Jacobi alone and demanded a 100x
+  // reduction in divergence. Jacobi delivered 32x and the check failed -- but
+  // the solver was fine and the threshold was invented. Jacobi's error
+  // reduction per sweep approaches 1 for the long-wavelength pressure modes, so
+  // on a 64^2 grid a few hundred sweeps genuinely cannot clear them. That is
+  // the method, not a defect, and it is precisely why red-black (and multigrid
+  // beyond it) exist. Asserting the contrast tests something true; asserting a
+  // made-up constant tested my guess.
+  {
+    const g = new Grid(N, N);
+    let s = 4242;
+    const rnd = () => { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff - 0.5; };
+    const u0 = g.u(), v0 = g.v();
+    for (let i = 0; i < u0.length; i++) { u0[i] = rnd(); v0[i] = rnd(); }
+
+    const res = {};
+    for (const solver of ["jacobi", "red-black"]) {
+      const gpu = new GPUFluidSolver(device, {
+        n: N, nu: 0, pressureSolver: solver, pressureIterations: 200, hasTimestamps,
+      });
+      gpu.uploadVelocity(u0, v0);
+      const before = await gpu.maxDivergence();
+      gpu.step(0.01);
+      const after = await gpu.maxDivergence();
+      res[solver] = { before, after, reduction: before / after };
+      gpu.destroy();
+    }
+    R.projection = res;
+
+    check("GPU projection substantially reduces divergence",
+      res["red-black"].reduction > 100,
+      `red-black: ${res["red-black"].before.toExponential(2)} -> ` +
+      `${res["red-black"].after.toExponential(2)} (${res["red-black"].reduction.toFixed(0)}x)`);
+    check("red-black clears divergence better than Jacobi at equal cost",
+      res["red-black"].after < res["jacobi"].after,
+      `after 200 sweeps: RB ${res["red-black"].after.toExponential(2)} vs ` +
+      `J ${res["jacobi"].after.toExponential(2)} ` +
+      `(${(res["jacobi"].after / res["red-black"].after).toFixed(1)}x better)`);
+  }
+
+  // ------------------------------------ 4. pressure-solver convergence comparison
+  // The "not a toy approximation" evidence: residual vs iteration count for
+  // each method, measured rather than asserted.
+  {
+    const curves = {};
+    for (const solver of ["jacobi", "red-black", "multigrid"]) {
+      const gpu = new GPUFluidSolver(device, { n: N, nu: 0, pressureSolver: solver, hasTimestamps });
+      const g = new Grid(N, N);
+      let s = 777;
+      const rnd = () => { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff - 0.5; };
+      const u0 = g.u(), v0 = g.v();
+      for (let i = 0; i < u0.length; i++) { u0[i] = rnd(); v0[i] = rnd(); }
+      gpu.uploadVelocity(u0, v0);
+
+      // Multigrid's unit is a V-CYCLE, not a sweep, and one V-cycle costs
+      // about 4/3 of a fine-grid sweep. Giving it the same numeric budget as
+      // the flat sweepers would compare 320 V-cycles against 320 sweeps, which
+      // is not a fair axis. The report plots residual against ESTIMATED SWEEP
+      // COST so the three curves share a meaningful x-axis.
+      const budget = solver === "multigrid"
+        ? [0, 1, 2, 3, 4, 5, 6, 8, 10, 12]
+        : [0, 1, 2, 5, 10, 20, 40, 80, 160, 320];
+      const pts = [];
+      for (const it of budget) {
+        pts.push({
+          iterations: it,
+          equivalentSweeps: solver === "multigrid" ? it * (4 / 3) * 4 : it,
+          residual: await gpu.poissonResidualAfter(it),
+        });
+      }
+      curves[solver] = pts;
+      log(`  ${solver.padEnd(11)} ${pts.map(p => p.residual.toExponential(1)).join("  ")}`);
+      gpu.destroy();
+    }
+    R.poissonCurves = curves;
+    const j = curves["jacobi"], rb = curves["red-black"];
+    const last = j.length - 1;
+    check("red-black Gauss-Seidel converges faster than Jacobi",
+      rb[last].residual < j[last].residual,
+      `at ${j[last].iterations} sweeps: RB ${rb[last].residual.toExponential(2)} vs J ${j[last].residual.toExponential(2)}`);
+    check("Jacobi residual decreases monotonically",
+      j.every((p, i) => i === 0 || p.residual <= j[i - 1].residual * 1.001),
+      "");
+  }
+
+  // ------------------------------------------ 5. full step: GPU vs CPU trajectory
+  // The end-to-end agreement gate. Both solvers, same initial condition, same
+  // number of steps, compared field by field.
+  {
+    const nuFull = 0.0;
+    const g = new Grid(N, N);
+    const [u0, v0] = taylorGreen.init(g, g.u(), g.v(), 0, nuFull);
+
+    const cpu = new FluidSolver({
+      n: N, nu: nuFull, validation: true, advection: "semi-lagrangian", projection: "fft",
+    });
+    cpu.u.set(u0); cpu.v.set(v0);
+
+    const gpu = new GPUFluidSolver(device, {
+      n: N, nu: nuFull, pressureSolver: "red-black", pressureIterations: 400,
+      advection: "semi-lagrangian", hasTimestamps,
+    });
+    gpu.uploadVelocity(u0, v0);
+
+    const STEPS = 10;
+    for (let k = 0; k < STEPS; k++) {
+      cpu.step(dt, { advectDye: false });
+      gpu.step(dt);
+    }
+    const { u, v } = await gpu.readVelocity();
+    const du = relDiff(u, cpu.u), dv = relDiff(v, cpu.v);
+    const gdiv = await gpu.maxDivergence();
+
+    check(`GPU matches CPU after ${STEPS} full steps`, Math.max(du, dv) < 5e-3,
+      `relL2 u=${du.toExponential(2)} v=${dv.toExponential(2)}`);
+    check("GPU keeps the field divergence-free", gdiv < 1e-3,
+      `max|div|=${gdiv.toExponential(2)} (CPU ${cpu.maxDivergence().toExponential(2)})`);
+    R.fullStep = { steps: STEPS, du, dv, gpuMaxDiv: gdiv, cpuMaxDiv: cpu.maxDivergence() };
+    gpu.destroy();
+  }
+
+
+  // Post to the collector so the report is built from a file rather than a
+  // screenshot of this page. Failure is non-fatal: the harness is still useful
+  // interactively when the collector is not running.
+  try {
+    await fetch("http://127.0.0.1:8932/gpu-verify", { method: "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify(R) });
+    log("posted to results/gpu-verify.json", "ok");
+  } catch (e) { log("collector unreachable (results not saved)", "warn"); }
+  // ------------------------------------------- 6. MacCormack matches the CPU
+  // Ported to the GPU after the energy spectrum came out at -6.1 against
+  // Kraichnan's -3, which the CPU measurements attributed to semi-Lagrangian's
+  // dissipation. A new scheme is only worth anything if it is the same scheme,
+  // so it is checked against the f64 reference the same way.
+  {
+    const nuFull = 0.0;
+    const g = new Grid(N, N);
+    const [u0, v0] = taylorGreen.init(g, g.u(), g.v(), 0, nuFull);
+
+    const cpu = new FluidSolver({
+      n: N, nu: nuFull, validation: true, advection: "maccormack", projection: "fft",
+    });
+    cpu.u.set(u0); cpu.v.set(v0);
+    const gpu = new GPUFluidSolver(device, {
+      n: N, nu: nuFull, pressureSolver: "multigrid", pressureIterations: 4,
+      advection: "maccormack", hasTimestamps,
+    });
+    gpu.uploadVelocity(u0, v0);
+
+    const STEPS = 10;
+    for (let k = 0; k < STEPS; k++) {
+      cpu.step(dt, { advectDye: false });
+      gpu.step(dt);
+    }
+    const { u, v } = await gpu.readVelocity();
+    const du = relDiff(u, cpu.u), dv = relDiff(v, cpu.v);
+    check(`GPU MacCormack matches CPU after ${STEPS} steps`, Math.max(du, dv) < 5e-3,
+      `relL2 u=${du.toExponential(2)} v=${dv.toExponential(2)}`);
+    R.macCormack = { steps: STEPS, du, dv };
+    gpu.destroy();
+  }
+
+  // ------------------------------- 7. MacCormack is less dissipative on the GPU
+  {
+    const nuFull = 0.0;
+    const g = new Grid(N, N);
+    const ke = {};
+    for (const scheme of ["semi-lagrangian", "maccormack"]) {
+      const [u0, v0] = taylorGreen.init(g, g.u(), g.v(), 0, nuFull);
+      const gpu = new GPUFluidSolver(device, {
+        n: N, nu: 0, pressureSolver: "multigrid", pressureIterations: 3,
+        advection: scheme, hasTimestamps,
+      });
+      gpu.uploadVelocity(u0, v0);
+      for (let k = 0; k < 200; k++) gpu.step(0.01);
+      const vel = await gpu.readVelocity();
+      let e = 0;
+      for (let i = 0; i < vel.u.length; i++) e += vel.u[i] ** 2 + vel.v[i] ** 2;
+      ke[scheme] = 0.5 * e / vel.u.length;
+      gpu.destroy();
+    }
+    // With nu = 0 the exact solution conserves energy exactly, so whatever is
+    // missing is the scheme's own dissipation and nothing else.
+    const exact = 0.25;
+    check("GPU MacCormack retains more energy than semi-Lagrangian",
+      ke.maccormack > ke["semi-lagrangian"],
+      `after 200 steps at nu=0 (exact conserves ${exact}): ` +
+      `SL ${ke["semi-lagrangian"].toFixed(4)}, MC ${ke.maccormack.toFixed(4)}`);
+    R.schemeEnergy = { ...ke, exact };
+  }
+
+  R.done = true;
+  const passed = R.checks.filter(c => c.pass).length;
+  log(`\n${passed}/${R.checks.length} checks passed`,
+    passed === R.checks.length ? "ok" : "bad");
+}
+
+main().catch(e => {
+  R.done = true;
+  R.errors.push(String(e && e.stack || e));
+  log(`ERROR ${e && e.stack || e}`, "bad");
+});
+</script>
+</body>
+</html>

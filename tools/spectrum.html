@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Forced 2D turbulence — energy spectrum</title>
+<style>
+  body { background:#0b0c10; color:#d8dee9; font:13px ui-monospace,Consolas,monospace;
+         margin:0; padding:1.5rem; display:flex; gap:1.5rem; flex-wrap:wrap }
+  pre { white-space:pre-wrap; line-height:1.6; margin:0 }
+  canvas { border:1px solid #222; image-rendering:pixelated }
+  h1 { font-size:1rem; letter-spacing:.1em; text-transform:uppercase; color:#8ab4f8; width:100% }
+  .ok{color:#8fd694} .warn{color:#ffcc66}
+</style>
+</head>
+<body>
+<h1>Forced 2D turbulence — energy spectrum</h1>
+<div><canvas id="view" width="512" height="512"></canvas></div>
+<pre id="out">running…</pre>
+
+<script type="module">
+/**
+ * The energy-spectrum study, run on the GPU.
+ *
+ * WHY THIS MOVED OFF THE CPU. A 2D inverse cascade has to carry energy from the
+ * forcing wavenumber up through every intervening octave, and each octave takes
+ * several eddy turnover times. The f64 CPU version reached step 5000 of 25000
+ * in 35 minutes -- about three hours for the full run -- and at t=20 the
+ * inverse range was still not a power law (r^2 = 0.49). This is the workload
+ * that justifies the GPU, so it is the workload the GPU runs.
+ *
+ * WHAT MAKES IT TRUSTWORTHY ANYWAY. Three things:
+ *   - the projection uses MULTIGRID, converged to max|div| ~ 1e-6, so the
+ *     velocity field really is solenoidal. An under-converged projection leaves
+ *     divergence, and divergence contaminates the spectrum at exactly the high
+ *     wavenumbers whose slope is being measured.
+ *   - the GPU solver was verified field-by-field against the f64 CPU reference
+ *     to 3.3e-6 relative over 10 steps
+ *   - Parseval is checked on the final spectrum: sum E(k) must equal the
+ *     kinetic energy computed independently in physical space
+ *
+ * CONFINEMENT IS OFF. It is an artificial energy source; a spectrum measured
+ * with it on would be measuring the confinement parameter.
+ *
+ * THE FIT WINDOWS are fixed from the forcing wavenumber before any data is
+ * seen, because choosing them afterwards is how almost any curve is made to
+ * agree with a power law.
+ */
+import { createDevice, GPUFluidSolver } from "../src/gpu/solver.js";
+import { energySpectrum, fitSlope, parsevalCheck } from "../src/core/fft.js";
+
+const out = document.getElementById("out");
+const lines = [];
+const log = (s, cls) => { lines.push(cls ? `<span class="${cls}">${s}</span>` : s); out.innerHTML = lines.join("\n"); };
+
+const R = { errors: [] };
+window.__SPECTRUM__ = R;
+
+const P = {
+  n: 512,
+  nu: 0.0,           // no explicit viscosity: numerical dissipation dominates
+                     // at this resolution anyway, and pretending otherwise
+                     // would put a physical-looking number on an artifact
+  dt: 0.004,
+  kf: 40,            // forcing wavenumber: leaves k<25 for the inverse range
+  forcingWidth: 2,
+  amp: 2.4,
+  drag: 0.04,        // large-scale friction, or the inverse cascade condenses
+  vCycles: 3,        // multigrid: converged projection
+  steps: 24000,
+  sampleFrom: 0.55,  // start time-averaging once the flow has plateaued
+  sampleEvery: 40,
+  advection: "maccormack",
+};
+
+// Windows fixed from k_f and the grid, before the spectrum is looked at.
+const kmax = Math.floor(P.n / 2);
+const WIN = {
+  inverse: [4, Math.floor(P.kf * 0.6)],            // [4, 24]
+  enstrophy: [Math.ceil(P.kf * 1.6), Math.floor(kmax * 0.6)],  // [64, 153]
+};
+
+/**
+ * Band-limited divergence-free forcing, built from an explicit list of modes so
+ * it is exactly band-limited. Adding noise and filtering would leak energy into
+ * the very ranges whose slopes are being measured.
+ */
+function makeForcing(n, dx) {
+  let s = 20260828 >>> 0;
+  const rnd = () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; };
+  const modes = [];
+  for (let m = 0; m < 32; m++) {
+    const th = 2 * Math.PI * rnd();
+    const km = P.kf + (rnd() - 0.5) * 2 * P.forcingWidth;
+    modes.push({ kx: Math.round(km * Math.cos(th)), ky: Math.round(km * Math.sin(th)),
+                 ph: 2 * Math.PI * rnd() });
+  }
+  return modes.filter(m => m.kx !== 0 || m.ky !== 0);
+}
+
+async function main() {
+  const { device, hasTimestamps, info } = await createDevice();
+  R.adapter = info;
+  log(`adapter ${info.vendor} ${info.architecture}`);
+  log(`grid ${P.n}^2, kf=${P.kf}, ${P.advection}, multigrid ${P.vCycles} V-cycles, confinement OFF`);
+  log(`fit windows (fixed in advance): inverse ${JSON.stringify(WIN.inverse)}, ` +
+      `enstrophy ${JSON.stringify(WIN.enstrophy)}`);
+  log("");
+
+  const gpu = new GPUFluidSolver(device, {
+    n: P.n, nu: P.nu, confinement: 0,
+    // MacCormack. The first run of this study used semi-Lagrangian and measured
+    // an enstrophy slope of -6.08 against Kraichnan's -3; the Taylor-Green
+    // measurements attribute that to the first-order scheme's dissipation, which
+    // removes energy across the whole resolved band rather than only near the
+    // grid scale. This re-runs the same study with the less dissipative scheme
+    // so the attribution can be checked rather than asserted.
+    advection: P.advection,
+    pressureSolver: "multigrid", pressureIterations: P.vCycles, hasTimestamps,
+  });
+  const modes = makeForcing(P.n, gpu.dx).map(m => ({ kx: m.kx, ky: m.ky, phase: m.ph }));
+  gpu.setForcing(modes, { amplitude: P.amp, drag: P.drag, phaseDrift: 0.3 });
+  log(`${modes.length} forcing modes, applied on the GPU`);
+
+  const n = P.n;
+  const u = new Float32Array(n * n), v = new Float32Array(n * n);
+  gpu.uploadVelocity(u, v);
+
+  const canvas = document.getElementById("view");
+  const ctx = canvas.getContext("2d");
+
+  // Log densely at first so the run's rate is measurable early, then sparsely.
+  const LOG_EVERY = 1000;
+  const sampleFromStep = Math.floor(P.steps * P.sampleFrom);
+  let accum = null, samples = 0;
+  const trace = [], snapshots = [];
+  const t0 = performance.now();
+
+  for (let k = 0; k < P.steps; k++) {
+    // Forcing and drag now run as a GPU kernel inside step(). The first
+    // version applied them on the CPU between steps, which meant a full 512^2
+    // readback plus 8.4 million cosines every four steps -- the GPU sat idle
+    // waiting for it and the run was slower than the pure-CPU solver.
+    gpu.step(P.dt);
+
+    // Throttle. `step` only ENQUEUES work and returns immediately, so an
+    // unthrottled loop submits thousands of frames faster than the GPU can
+    // retire them: the queue grows without bound, the page stops responding,
+    // and the run appears hung. Syncing every 20 steps keeps the queue shallow
+    // and lets the browser breathe.
+    if (k % 20 === 19) await device.queue.onSubmittedWorkDone();
+
+    if (k % LOG_EVERY === 0 || k === P.steps - 1) {
+      const vel = await gpu.readVelocity();
+      const [cu, cv] = centers(vel.u, vel.v, n);
+      const sp = energySpectrum(cu, cv, n, n);
+      const inv = fitSlope(sp.k, sp.E, WIN.inverse[0], WIN.inverse[1]);
+      const ens = fitSlope(sp.k, sp.E, WIN.enstrophy[0], WIN.enstrophy[1]);
+      let ke = 0;
+      for (let i = 0; i < cu.length; i++) ke += cu[i] * cu[i] + cv[i] * cv[i];
+      ke = 0.5 * ke / cu.length;
+      trace.push({ step: k, t: k * P.dt, ke });
+      snapshots.push({ step: k, t: k * P.dt, ke,
+        inverseSlope: inv.slope, inverseR2: inv.r2,
+        enstrophySlope: ens.slope, enstrophyR2: ens.r2 });
+      log(`step ${String(k).padStart(6)} t=${(k * P.dt).toFixed(1).padStart(6)} ` +
+          `KE=${ke.toExponential(2)} ` +
+          `inv=${inv.slope.toFixed(2).padStart(6)}(r2 ${inv.r2.toFixed(2)}) ` +
+          `ens=${ens.slope.toFixed(2).padStart(6)}(r2 ${ens.r2.toFixed(2)}) ` +
+          `[${((performance.now() - t0) / 1000).toFixed(0)}s]`);
+      drawVorticity(ctx, vel.u, vel.v, n, gpu.dx);
+    }
+
+    if (k >= sampleFromStep && k % P.sampleEvery === 0) {
+      const vel = await gpu.readVelocity();
+      const [cu, cv] = centers(vel.u, vel.v, n);
+      const sp = energySpectrum(cu, cv, n, n);
+      if (!accum) accum = new Float64Array(sp.E.length);
+      for (let i = 0; i < sp.E.length; i++) accum[i] += sp.E[i];
+      samples++;
+    }
+  }
+
+  const E = new Float64Array(accum.length);
+  for (let i = 0; i < accum.length; i++) E[i] = accum[i] / samples;
+  const kArr = Array.from({ length: E.length }, (_, i) => i);
+
+  const inv = fitSlope(kArr, E, WIN.inverse[0], WIN.inverse[1]);
+  const ens = fitSlope(kArr, E, WIN.enstrophy[0], WIN.enstrophy[1]);
+
+  const vel = await gpu.readVelocity();
+  const [cu, cv] = centers(vel.u, vel.v, n);
+  const par = parsevalCheck(cu, cv, n, n);
+  const div = await gpu.maxDivergence();
+
+  R.result = {
+    params: P, windows: WIN, samples,
+    wallSeconds: (performance.now() - t0) / 1000,
+    spectrum: { k: Array.from(kArr), E: Array.from(E) },
+    fits: { inverseCascade: { ...inv, theory: -5 / 3 },
+            enstrophyCascade: { ...ens, theory: -3 } },
+    parseval: par, maxDivergence: div, trace, snapshots,
+    adapter: info,
+  };
+  R.done = true;
+  try {
+    await fetch("http://127.0.0.1:8932/spectrum-maccormack", { method: "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify(R.result) });
+    log("posted to results/spectrum-maccormack.json", "ok");
+  } catch (e) { log("collector unreachable (results not saved)", "warn"); }
+
+  log("");
+  log(`time-averaged over ${samples} samples`, "ok");
+  log(`inverse   ${inv.slope.toFixed(3)}  (theory -1.667)  r2=${inv.r2.toFixed(3)}  k in ${JSON.stringify(WIN.inverse)}`);
+  log(`enstrophy ${ens.slope.toFixed(3)}  (theory -3.000)  r2=${ens.r2.toFixed(3)}  k in ${JSON.stringify(WIN.enstrophy)}`);
+  log(`parseval relDiff ${par.relDiff.toExponential(2)}  max|div| ${div.toExponential(2)}`);
+  gpu.destroy();
+}
+
+function centers(u, v, n) {
+  const cu = new Float64Array(n * n), cv = new Float64Array(n * n);
+  for (let j = 0; j < n; j++) {
+    for (let i = 0; i < n; i++) {
+      const k = j * n + i;
+      cu[k] = 0.5 * (u[k] + u[j * n + ((i + 1) % n)]);
+      cv[k] = 0.5 * (v[k] + v[((j + 1) % n) * n + i]);
+    }
+  }
+  return [cu, cv];
+}
+
+function drawVorticity(ctx, u, v, n, dx) {
+  const img = ctx.createImageData(n, n);
+  let maxw = 1e-9;
+  const w = new Float32Array(n * n);
+  for (let j = 0; j < n; j++) {
+    for (let i = 0; i < n; i++) {
+      const im = (i - 1 + n) % n, jm = (j - 1 + n) % n;
+      const dvdx = (v[j * n + i] - v[j * n + im]) / dx;
+      const dudy = (u[j * n + i] - u[jm * n + i]) / dx;
+      const c = dvdx - dudy;
+      w[j * n + i] = c;
+      if (Math.abs(c) > maxw) maxw = Math.abs(c);
+    }
+  }
+  for (let k = 0; k < n * n; k++) {
+    const s = Math.tanh(w[k] / (maxw * 0.25));
+    const p = k * 4;
+    img.data[p] = 255 * Math.max(0, s);
+    img.data[p + 1] = 40;
+    img.data[p + 2] = 255 * Math.max(0, -s);
+    img.data[p + 3] = 255;
+  }
+  const tmp = document.createElement("canvas");
+  tmp.width = n; tmp.height = n;
+  tmp.getContext("2d").putImageData(img, 0, 0);
+  ctx.drawImage(tmp, 0, 0, ctx.canvas.width, ctx.canvas.height);
+}
+
+main().catch(e => { R.done = true; R.errors.push(String(e && e.stack || e)); log(`ERROR ${e && e.stack || e}`, "warn"); });
+</script>
+</body>
+</html>

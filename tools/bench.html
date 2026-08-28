@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CPU vs GPU benchmark</title>
+<style>
+  body { background:#0b0c10; color:#d8dee9; font:13px ui-monospace,Consolas,monospace;
+         margin:0; padding:1.5rem; }
+  pre { white-space:pre-wrap; line-height:1.65; }
+  h1 { font-size:1rem; letter-spacing:.1em; text-transform:uppercase; color:#8ab4f8 }
+  .ok{color:#8fd694} .warn{color:#ffcc66}
+</style>
+</head>
+<body>
+<h1>CPU vs GPU benchmark</h1>
+<pre id="out">running…</pre>
+
+<script type="module">
+/**
+ * Phase 4: how much does moving the PDE solve onto the GPU actually buy?
+ *
+ * TWO COMPARISONS, because either alone would be misleading.
+ *
+ * 1. SAME ALGORITHM (Jacobi, identical iteration count, identical grid). This
+ *    is the pure hardware comparison -- the same arithmetic, once serially and
+ *    once across GPU threads. It answers "what does parallelism buy", and it is
+ *    the number the GPU claim rests on.
+ *
+ * 2. BEST AVAILABLE ON EACH. The CPU's best pressure solver here is not Jacobi,
+ *    it is the FFT direct solve, which is exact and O(N log N). Comparing GPU
+ *    Jacobi against CPU Jacobi while the CPU has a far better option available
+ *    would flatter the GPU. So the practical comparison is reported too.
+ *
+ * Both run in ONE browser tab, on one machine, moments apart. Timing a Node
+ * process against a browser GPU would be comparing two runtimes.
+ *
+ * GPU timing uses timestamp-query for kernel time where available, plus
+ * wall-clock with an explicit queue sync. Wall clock alone would measure
+ * command submission rather than execution, since WebGPU work is asynchronous
+ * and `submit` returns immediately -- an unsynced GPU loop can appear
+ * arbitrarily fast.
+ */
+import { FluidSolver } from "../src/cpu/solver.js";
+import { taylorGreen } from "../src/core/analytic.js";
+import { createDevice, GPUFluidSolver } from "../src/gpu/solver.js";
+import { isPow2 } from "../src/core/fft.js";
+
+const out = document.getElementById("out");
+const lines = [];
+const log = (s, cls) => { lines.push(cls ? `<span class="${cls}">${s}</span>` : s); out.innerHTML = lines.join("\n"); };
+
+const R = { runs: [], errors: [] };
+window.__BENCH__ = R;
+
+const FRAME_60 = 1000 / 60;
+
+/** Median of an array. Robust to the one slow frame every scheduler produces. */
+const median = a => { const s = [...a].sort((x, y) => x - y); return s[Math.floor(s.length / 2)]; };
+
+async function timeGPU(gpu, dt, steps) {
+  // Warm up generously, and SYNC during the warmup.
+  //
+  // Three unsynced steps were not enough: the first two configurations measured
+  // came out at 11.9 ms (N=32) and 31.7 ms (N=64) while N=128 ran in 9.5 ms --
+  // a smaller grid taking three times longer, which is not physics. It is the
+  // driver compiling pipelines and the iGPU still at its idle clock. Warming up
+  // properly removes the artifact instead of leaving it in the published table.
+  for (let k = 0; k < 12; k++) {
+    gpu.step(dt);
+    if (k % 4 === 3) await gpu.device.queue.onSubmittedWorkDone();
+  }
+  await gpu.device.queue.onSubmittedWorkDone();
+
+  const times = [];
+  for (let k = 0; k < steps; k++) {
+    const t0 = performance.now();
+    gpu.step(dt);
+    // Sync EVERY step. Without this, submits queue up and the loop measures
+    // how fast JavaScript can enqueue commands, not how fast the GPU runs them.
+    await gpu.device.queue.onSubmittedWorkDone();
+    times.push(performance.now() - t0);
+  }
+  return { median: median(times), min: Math.min(...times), samples: times.length };
+}
+
+function timeCPU(cpu, dt, steps) {
+  for (let k = 0; k < 2; k++) cpu.step(dt, { advectDye: false });
+  const times = [];
+  for (let k = 0; k < steps; k++) {
+    const t0 = performance.now();
+    cpu.step(dt, { advectDye: false });
+    times.push(performance.now() - t0);
+  }
+  return { median: median(times), min: Math.min(...times), samples: times.length };
+}
+
+async function main() {
+  const { device, hasTimestamps, info, adapter } = await createDevice();
+  R.adapter = info;
+  R.hasTimestamps = hasTimestamps;
+  R.userAgent = navigator.userAgent;
+  R.hardwareConcurrency = navigator.hardwareConcurrency;
+  log(`adapter : ${info.vendor} ${info.architecture}`);
+  log(`cores   : ${navigator.hardwareConcurrency}`);
+  log("");
+
+  const dt = 0.005, nu = 0.0;
+  const ITERS = 40;                 // identical pressure-iteration budget for both
+
+  // ---------------------------------------- 1. same algorithm, same iterations
+  //
+  // Both devices run JACOBI with the same iteration count on the same grid, so
+  // the only difference is where the arithmetic happens. An earlier version of
+  // this ran conjugate gradient on the CPU against Jacobi on the GPU and called
+  // the difference "hardware" -- it was mostly the difference between two
+  // algorithms, and CG is far stronger per iteration.
+  log("SAME ALGORITHM (Jacobi, 40 sweeps, identical grid) -- ms/step, median");
+  log("     N    cells      CPU ms    GPU ms   speedup    CPU div    GPU div");
+  const sameAlgo = [];
+  for (const N of [32, 64, 128, 256, 512]) {
+    const cpu = new FluidSolver({
+      n: N, nu, validation: true, advection: "semi-lagrangian",
+      projection: "jacobi", projMaxIter: ITERS,
+    });
+    cpu.init((x, y) => taylorGreen.u(x, y, 0, 0.01), (x, y) => taylorGreen.v(x, y, 0, 0.01));
+    const nSteps = N >= 256 ? 3 : N >= 128 ? 6 : 15;
+    const c = timeCPU(cpu, dt, nSteps);
+
+    const gpu = new GPUFluidSolver(device, {
+      n: N, nu, pressureSolver: "jacobi", pressureIterations: ITERS, hasTimestamps,
+    });
+    gpu.uploadVelocity(cpu.u, cpu.v);
+    const g = await timeGPU(gpu, dt, Math.max(nSteps, 12));
+    const gdiv = await gpu.maxDivergence();
+    gpu.destroy();
+
+    // Both divergences are reported: equal time is only a fair comparison if
+    // both solvers also arrived at an equally good answer.
+    const row = { n: N, cells: N * N, cpuMs: c.median, gpuMs: g.median,
+                  speedup: c.median / g.median,
+                  cpuMaxDiv: cpu.maxDivergence(), gpuMaxDiv: gdiv };
+    sameAlgo.push(row);
+    log(`  ${String(N).padStart(4)}  ${String(N * N).padStart(7)}  ` +
+        `${c.median.toFixed(2).padStart(9)}  ${g.median.toFixed(2).padStart(8)}  ` +
+        `${row.speedup.toFixed(1).padStart(7)}x  ` +
+        `${row.cpuMaxDiv.toExponential(1).padStart(9)}  ${gdiv.toExponential(1).padStart(9)}`);
+  }
+  R.sameAlgorithm = { pressureIterations: ITERS, rows: sameAlgo };
+
+  // ------------------------------------------ 2. equal QUALITY, not equal work
+  //
+  // The practical comparison, done honestly. The CPU's best option is the exact
+  // FFT Poisson solve (divergence ~1e-15). Timing that against 20 GPU sweeps
+  // that leave divergence at 2.5e-1 -- as an earlier version of this did, and
+  // reported "38.9x" -- lets the GPU win by doing less work AND returning a
+  // worse answer.
+  //
+  // Instead the GPU is given as many red-black sweeps as it needs to reach a
+  // target divergence, and THAT is what gets timed. The sweep count is reported
+  // so the cost of matching the CPU's accuracy is visible.
+  const TARGET_DIV = 1e-3;
+  log("");
+  log(`EQUAL QUALITY -- GPU sweeps raised until max|div| <= ${TARGET_DIV}`);
+  log("     N    CPU-FFT ms   red-black (sweeps)          multigrid (V-cycles)");
+  log("                       ! = target not reached");
+  const best = [];
+  for (const N of [64, 128, 256, 512]) {
+    const cpu = new FluidSolver({
+      n: N, nu, validation: true, advection: "semi-lagrangian", projection: "fft",
+    });
+    cpu.init((x, y) => taylorGreen.u(x, y, 0, 0.01), (x, y) => taylorGreen.v(x, y, 0, 0.01));
+    const nSteps = N >= 256 ? 4 : 10;
+    const c = timeCPU(cpu, dt, nSteps);
+
+    // Find the smallest budget that reaches the target, for each GPU solver.
+    const gpuResult = {};
+    for (const [solver, budgets] of [
+      ["red-black", [10, 20, 40, 80, 160, 320, 640, 1280]],
+      ["multigrid", [1, 2, 3, 4, 5, 6, 8]],
+    ]) {
+      let used = null, gdiv = Infinity, gpu = null;
+      for (const trial of budgets) {
+        gpu?.destroy();
+        gpu = new GPUFluidSolver(device, {
+          n: N, nu, pressureSolver: solver, pressureIterations: trial, hasTimestamps,
+        });
+        gpu.uploadVelocity(cpu.u, cpu.v);
+        gpu.step(dt);
+        gdiv = await gpu.maxDivergence();
+        used = trial;
+        if (gdiv <= TARGET_DIV) break;
+      }
+      const g = await timeGPU(gpu, dt, Math.max(nSteps, 10));
+      gpu.destroy();
+      gpuResult[solver] = { ms: g.median, budget: used, div: gdiv,
+                            reachedTarget: gdiv <= TARGET_DIV };
+    }
+
+    const rb = gpuResult["red-black"], mg = gpuResult["multigrid"];
+    best.push({ n: N, cpuFftMs: c.median, cpuMaxDiv: cpu.maxDivergence(),
+                redBlack: rb, multigrid: mg,
+                ratioRedBlack: c.median / rb.ms, ratioMultigrid: c.median / mg.ms });
+    log(`  ${String(N).padStart(4)}  ${c.median.toFixed(2).padStart(11)}  ` +
+        `RB ${rb.ms.toFixed(1).padStart(6)}ms/${String(rb.budget).padStart(4)}sw ` +
+        `${(c.median / rb.ms).toFixed(2).padStart(5)}x ${rb.div.toExponential(1)}` +
+        `${rb.reachedTarget ? "" : "!"}  |  ` +
+        `MG ${mg.ms.toFixed(1).padStart(5)}ms/${String(mg.budget).padStart(2)}vc ` +
+        `${(c.median / mg.ms).toFixed(2).padStart(5)}x ${mg.div.toExponential(1)}` +
+        `${mg.reachedTarget ? "" : "!"}`);
+  }
+  R.equalQuality = { targetDivergence: TARGET_DIV, rows: best };
+
+  // ------------------------------------- 3. largest grid that holds 60 fps each
+  log("");
+  log("LARGEST GRID SUSTAINING 60 fps (16.7 ms/step)");
+  const interactive = { gpu: null, cpu: null, gpuRows: [], cpuRows: [] };
+
+  for (const N of [128, 256, 512, 1024, 2048]) {
+    const gpu = new GPUFluidSolver(device, {
+      n: N, nu, pressureSolver: "red-black", pressureIterations: 20, hasTimestamps,
+    });
+    const t = await timeGPU(gpu, dt, 24);   // more samples: this sits near the threshold
+    gpu.destroy();
+    interactive.gpuRows.push({ n: N, ms: t.median });
+    log(`  gpu  ${String(N).padStart(4)}  ${t.median.toFixed(2).padStart(7)} ms  ` +
+        `${t.median <= FRAME_60 ? "60fps" : "below"}`);
+    if (t.median <= FRAME_60) interactive.gpu = N;
+    if (t.median > FRAME_60 * 4) break;      // far past the limit; stop climbing
+  }
+
+  // Powers of two only, so every point uses the FFT projection. A run that
+  // included N=48 fell back to conjugate gradient there and reported 22.0 ms
+  // against 9.1 ms at N=64 -- a bigger grid running faster, which was an
+  // algorithm difference masquerading as measurement noise.
+  for (const N of [32, 64, 128, 256]) {
+    const cpu = new FluidSolver({
+      n: N, nu, validation: true, advection: "semi-lagrangian", projection: "fft",
+    });
+    cpu.init((x, y) => taylorGreen.u(x, y, 0, 0.01), (x, y) => taylorGreen.v(x, y, 0, 0.01));
+    const t = timeCPU(cpu, dt, N >= 256 ? 4 : 16);
+    interactive.cpuRows.push({ n: N, ms: t.median });
+    log(`  cpu  ${String(N).padStart(4)}  ${t.median.toFixed(2).padStart(7)} ms  ` +
+        `${t.median <= FRAME_60 ? "60fps" : "below"}`);
+    if (t.median <= FRAME_60) interactive.cpu = N;
+    if (t.median > FRAME_60 * 4) break;
+  }
+  R.interactive = interactive;
+
+  log("");
+  log(`interactive ceiling: GPU ${interactive.gpu}^2 = ${interactive.gpu ** 2} cells, ` +
+      `CPU ${interactive.cpu}^2 = ${interactive.cpu ** 2} cells ` +
+      `(${((interactive.gpu ** 2) / (interactive.cpu ** 2)).toFixed(1)}x more cells)`, "ok");
+
+  R.done = true;
+  // Post to the collector so the report is built from a file rather than a
+  // screenshot of this page. Failure is non-fatal: the harness is still useful
+  // interactively when the collector is not running.
+  try {
+    await fetch("http://127.0.0.1:8932/bench", { method: "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify(R) });
+    log("posted to results/bench.json", "ok");
+  } catch (e) { log("collector unreachable (results not saved)", "warn"); }
+  log("\ndone", "ok");
+}
+
+main().catch(e => {
+  R.done = true;
+  R.errors.push(String(e && e.stack || e));
+  log(`ERROR ${e && e.stack || e}`, "warn");
+});
+</script>
+</body>
+</html>

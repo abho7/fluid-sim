@@ -1,0 +1,12 @@
+{
+  "name": "fluid-sim",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "GPU-accelerated incompressible Navier-Stokes solver with analytic validation",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "validate": "node validate/run.js",
+    "serve": "node tools/serve.js"
+  }
+}
