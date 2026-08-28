@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 import { cpus, totalmem, platform, arch } from "node:os";
 
 import {
-  advectionDiffusion, taylorGreenStudy, convergenceStudy, stabilityStudy,
+  advectionDiffusion, taylorGreenStudy, convergenceStudy, stabilityStudy, fsiStudy,
 } from "./studies.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -62,6 +62,9 @@ function main() {
   const stability = section("stability sweeps", () =>
     stabilityStudy({ n: quick ? 32 : 64, nu: 0.02 }));
 
+  const fsi = section("fluid-structure interaction", () =>
+    fsiStudy({ n: quick ? 32 : 64, steps: quick ? 40 : 60 }));
+
   const payload = {
     env,
     totalWallSeconds: (Date.now() - t0) / 1000,
@@ -69,6 +72,7 @@ function main() {
     taylorGreen,
     convergence,
     stability,
+    fsi,
   };
 
   writeFileSync(join(OUT, "validation.json"), JSON.stringify(payload));
@@ -92,6 +96,13 @@ function main() {
   console.log(`  in solver:      stable to ${b.inSolver.lastStable}, unstable from ${b.inSolver.firstUnstable}`);
   const c = stability.confinement;
   console.log(`vorticity confinement starts ADDING energy at eps=${c.smallestEpsilonThatAddsEnergy}`);
+  const m = fsi.momentum.points;
+  console.log(`FSI momentum drift: exact path ${m[0].relativeDrift.toExponential(1)}, ` +
+    `added-mass-corrected ${m[1].relativeDrift.toExponential(1)}`);
+  console.log(`FSI no-slip: 1 pass ${fsi.noSlip.points[0].maxSlip.toExponential(1)}, ` +
+    `4 passes ${fsi.noSlip.points[3].maxSlip.toExponential(1)}`);
+  console.log(`FSI stable density >= ${fsi.translationStability.lowestStableDensity.plain} ` +
+    `(plain), ${fsi.translationStability.lowestStableDensity.corrected} (corrected)`);
   const pi = stability.projectionIterations.points;
   console.log(`projection: 1 iter -> maxDiv ${pi[0].maxDivergence.toExponential(1)}, ` +
     `${pi[pi.length-1].maxIter} iters -> ${pi[pi.length-1].maxDivergence.toExponential(1)}`);

@@ -26,6 +26,7 @@ So the report answers, with measurements:
 | What order is it? | **First order in time** — Lie splitting caps it there regardless of the operators, which are individually second order. |
 | Does it reproduce turbulence? | **Partly, and the difference is diagnosable.** The 2D inverse energy cascade measures **-1.525** against Kraichnan's −5/3 (r² = 0.986) — within 9%. The enstrophy cascade is **-4.529** against −3: a very clean power law (r² = 0.999) at the wrong exponent. |
 | Is it really incompressible? | max \|∇·u\| ≈ **1e-13** on the CPU reference; ~1e-6 on the GPU with multigrid. |
+| Does the two-way coupling conserve momentum? | **1.1e-14** relative drift per coupling step — Newton's third law holds to machine precision. |
 
 ## Method
 
@@ -75,7 +76,7 @@ performance comparison.
 ## Running it
 
 ```bash
-node --test test/*.test.js     # 61 tests
+node --test test/*.test.js     # 76 tests
 node validate/run.js           # regenerate every CPU-side number
 node tools/serve.js            # WebGPU needs a secure context; localhost counts
 node tools/build_report.js     # rebuild report.html from results/*.json
@@ -89,6 +90,9 @@ With the server up:
 | `/tools/gputest.html` | verifies every GPU kernel against the f64 CPU reference |
 | `/tools/bench.html` | CPU vs GPU, same algorithm and at equal solution quality |
 | `/tools/spectrum.html` | forced 2D turbulence, energy spectrum |
+
+The demo's **obstacle** dropdown attaches an immersed rigid disk — free or pinned —
+that blocks the flow and is pushed by it.
 
 `node tools/collect.js` receives results from those pages and writes them to
 `results/`, so every published number traces to a run.

@@ -31,6 +31,7 @@ import { Grid } from "../core/grid.js";
 import { ADVECTION } from "./advect.js";
 import { solvePoissonCG, solvePoissonFFT, solvePoissonJacobi, laplacian } from "./projection.js";
 import { fft2, ifft2, isPow2 } from "../core/fft.js";
+import { applyCoupling } from "./solid.js";
 
 /**
  * Implicit diffusion, solved with conjugate gradient.
@@ -252,6 +253,9 @@ export class FluidSolver {
     confinement = 0, explicitDiffusion = false,
     projTol = 1e-10, projMaxIter = 2000,
     projection = "cg",
+    solids = [],
+    maskWidth = 1.5,
+    couplingPasses = 2,
     validation = false,
   } = {}) {
     this.g = new Grid(nx, ny, lx, ly);
@@ -292,6 +296,12 @@ export class FluidSolver {
         `fft projection needs power-of-two dimensions, got ${nx}x${ny}`);
     }
     this.projection = projection;
+
+    // Immersed rigid bodies. Empty by default; the solver is unchanged when
+    // there are none, so the coupling cannot perturb any existing result.
+    this.solids = solids;
+    this.maskWidth = maskWidth;
+    this.couplingPasses = couplingPasses;
 
     const g = this.g;
     this.u = g.u();
@@ -346,6 +356,19 @@ export class FluidSolver {
       vorticityConfinement(g, this.u, this.v, this.confinement, dt);
     }
     if (opts.drag > 0) linearDrag(this.u, this.v, opts.drag, dt);
+
+    // 3b. fluid-structure coupling, BEFORE the projection.
+    //
+    // Direct forcing sets the velocity inside each solid without regard to
+    // incompressibility, so it introduces divergence that the projection then
+    // removes. Doing it the other way round would leave the field divergent for
+    // the rest of the step, and a passive tracer would visibly pool against the
+    // obstacle -- an artifact of ordering that reads as the fluid compressing.
+    if (this.solids.length) {
+      applyCoupling(g, this.u, this.v, this.solids, dt,
+        { maskWidth: this.maskWidth, passes: this.couplingPasses });
+      for (const sd of this.solids) sd.integrate(dt, { gravity: opts.gravity ?? 0 });
+    }
 
     // 4. projection -- last, so nothing reintroduces divergence afterwards
     const div = divergence(g, this.u, this.v);

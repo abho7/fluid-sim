@@ -550,6 +550,93 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 `;
 
 /**
+ * Direct-forcing coupling for an immersed rigid disk, on the GPU.
+ *
+ * Mirrors `src/cpu/solid.js`, which is the validated reference: the fluid inside
+ * a smoothed mask is driven toward the body velocity, and the per-cell impulse
+ * is written to a second texture so the reaction on the body can be integrated.
+ *
+ * WHY THE IMPULSE IS WRITTEN OUT rather than reduced here. The force on the body
+ * is the integral of the impulse over the mask, which is a reduction, and a
+ * reduction on the GPU needs either a multi-pass tree or subgroup operations.
+ * Writing the field and summing it on the CPU costs one readback per step and
+ * keeps this kernel identical in structure to the CPU version -- which is what
+ * makes them comparable. The readback cost is measured and reported rather than
+ * assumed negligible.
+ *
+ * Disk parameters arrive packed in the uniform block:
+ *   param_a = radius, param_b = mask width (in world units)
+ * and the centre/velocity in the Solid uniform.
+ */
+export const SOLID_COUPLE = /* wgsl */`
+struct Solid {
+  pos   : vec2<f32>,
+  vel   : vec2<f32>,
+  omega : f32,
+  radius: f32,
+  width : f32,
+  _pad  : f32,
+};
+@group(0) @binding(1) var<uniform> S : Solid;
+@group(0) @binding(2) var src : texture_2d<f32>;
+@group(0) @binding(3) var dst : texture_storage_2d<rgba32float, write>;
+@group(0) @binding(4) var imp : texture_storage_2d<rgba32float, write>;
+
+fn wrapDelta(d: f32, L: f32) -> f32 {
+  return d - L * round(d / L);
+}
+
+fn maskAt(p: vec2<f32>) -> f32 {
+  let L = vec2<f32>(f32(P.nx) * P.dx, f32(P.ny) * P.dy);
+  let d = vec2<f32>(wrapDelta(p.x - S.pos.x, L.x), wrapDelta(p.y - S.pos.y, L.y));
+
+  // CLAMP BEFORE tanh. The argument is (distance - radius)/width, and with a
+  // mask width of 1.5 cells that reaches ~240 at the far side of the domain.
+  // WGSL does not require tanh to be robust for large arguments, and this
+  // adapter evidently computes it as (e^x - e^-x)/(e^x + e^-x): at x = 240 both
+  // terms overflow to infinity and the result is Inf/Inf = NaN. 162981 of
+  // 262144 cells came back NaN -- every cell far from the disk, which is
+  // exactly the region where the mask should have been a clean zero.
+  //
+  // Math.tanh on the CPU is robust, so the reference implementation showed
+  // nothing. tanh saturates to 1 well before x = 10 in f32, so clamping there
+  // changes no representable value.
+  let t = clamp((length(d) - S.radius) / S.width, -10.0, 10.0);
+  return 0.5 * (1.0 - tanh(t));
+}
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = i32(gid.x); let j = i32(gid.y);
+  if (gid.x >= P.nx || gid.y >= P.ny) { return; }
+
+  let L = vec2<f32>(f32(P.nx) * P.dx, f32(P.ny) * P.dy);
+  let c = loadTex(src, i, j);
+
+  // u-face
+  let pu = posU(i, j);
+  let cu = maskAt(pu);
+  let du_ = vec2<f32>(wrapDelta(pu.x - S.pos.x, L.x), wrapDelta(pu.y - S.pos.y, L.y));
+  let su = S.vel.x - S.omega * du_.y;          // rigid-body velocity, x component
+  let dU = cu * (su - c.x);
+
+  // v-face
+  let pv = posV(i, j);
+  let cv = maskAt(pv);
+  let dv_ = vec2<f32>(wrapDelta(pv.x - S.pos.x, L.x), wrapDelta(pv.y - S.pos.y, L.y));
+  let sv = S.vel.y + S.omega * dv_.x;
+  let dV = cv * (sv - c.y);
+
+  textureStore(dst, vec2<i32>(i, j), vec4<f32>(c.x + dU, c.y + dV, 0.0, 0.0));
+
+  // Impulse per cell, and the torque contribution, for the CPU-side sum.
+  // z carries r x F: (-dy*Fx) from the u-face plus (dx*Fy) from the v-face.
+  let tq = -du_.y * dU + dv_.x * dV;
+  textureStore(imp, vec2<i32>(i, j), vec4<f32>(dU, dV, tq, 0.0));
+}
+`;
+
+/**
  * Render kernel: velocity/vorticity -> colour.
  *
  * The colour is a function of the physics, not decoration layered on top. Two

@@ -33,7 +33,7 @@
 import {
   COMMON, SAMPLING, ADVECT_VELOCITY, ADVECT_SCALAR, DIVERGENCE,
   JACOBI, RED_BLACK_GS, SUBTRACT_GRADIENT, DIFFUSE, VORTICITY_CONFINEMENT,
-  SPLAT, RENDER, FORCING, ADVECT_FIELD_BY, MACCORMACK_COMBINE,
+  SPLAT, RENDER, FORCING, ADVECT_FIELD_BY, MACCORMACK_COMBINE, SOLID_COUPLE,
 } from "./shaders.js";
 import { Multigrid } from "./multigrid.js";
 
@@ -65,6 +65,7 @@ export class GPUFluidSolver {
     n = 256, nx = n, ny = n, lx = 2 * Math.PI, ly = 2 * Math.PI,
     nu = 0.0, confinement = 0, dyeFade = 0,
     advection = "maccormack",
+    solidMaskWidth = 1.5,
     pressureSolver = "jacobi", pressureIterations = 40,
     hasTimestamps = false,
   } = {}) {
@@ -73,6 +74,9 @@ export class GPUFluidSolver {
     this.dx = lx / nx; this.dy = ly / ny;
     this.nu = nu;
     this.advection = advection;
+    this.solidMaskWidth = solidMaskWidth;
+    this.solid = null;
+    this._solidBusy = false;
     this.confinement = confinement;
     this.dyeFade = dyeFade;
     this.pressureSolver = pressureSolver;
@@ -116,6 +120,8 @@ export class GPUFluidSolver {
     this.div = this._tex();
     // MacCormack round-trip scratch, allocated only when that scheme is used.
     this.mcFwd = null; this.mcBack = null;
+    // Immersed-solid coupling scratch, allocated only if a solid is attached.
+    this.impulseTex = null; this.solidBuf = null; this.impulseRead = null;
     this.velIdx = 0; this.presIdx = 0; this.dyeIdx = 0;
 
     this.output = this._tex("rgba8unorm");
@@ -195,6 +201,7 @@ export class GPUFluidSolver {
       forcing: this._pipeline(FORCING),
       advectFieldBy: this._pipeline(ADVECT_FIELD_BY),
       macCombine: this._pipeline(MACCORMACK_COMBINE),
+      solidCouple: this._pipeline(SOLID_COUPLE),
     };
   }
 
@@ -358,6 +365,102 @@ export class GPUFluidSolver {
     this._swapVel();
   }
 
+
+  /**
+   * Attach a single immersed rigid disk. Pass null to remove it.
+   *
+   * Deliberately one body rather than a list: the force integration needs a
+   * readback per body per step, so N bodies cost N readbacks, and a demo with
+   * one obstacle is the honest scope for this path. The CPU solver takes an
+   * array and is where multi-body work would go.
+   */
+  setSolid(disk) {
+    this.solid = disk || null;
+    if (!disk) return;
+    if (!this.impulseTex) {
+      this.impulseTex = this._tex();
+      this.solidBuf = this.device.createBuffer({
+        size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      this.impulseRead = this.device.createBuffer({
+        size: this.nx * this.ny * 16,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      });
+    }
+  }
+
+  _encodeSolid(enc, dt) {
+    const d = this.solid;
+    if (!d) return;
+
+    const sb = new ArrayBuffer(32);
+    new Float32Array(sb).set([
+      d.x, d.y, d.vx, d.vy, d.omega, d.r, this.solidMaskWidth * this.dx, 0,
+    ]);
+    this.device.queue.writeBuffer(this.solidBuf, 0, sb);
+
+    const offset = this._writeParams(dt);
+    const bg = this.device.createBindGroup({
+      layout: this.pipe.solidCouple.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.params, offset, size: 32 } },
+        { binding: 1, resource: { buffer: this.solidBuf } },
+        { binding: 2, resource: this.velCur.createView() },
+        { binding: 3, resource: this.velNext.createView() },
+        { binding: 4, resource: this.impulseTex.createView() },
+      ],
+    });
+    const pass = enc.beginComputePass();
+    this._dispatch(pass, this.pipe.solidCouple, bg);
+    pass.end();
+    this._swapVel();
+  }
+
+  /**
+   * Sum the impulse field and advance the body.
+   *
+   * Async and one step behind: the readback cannot complete inside the step that
+   * produced it without stalling the pipeline, so the force applied here comes
+   * from the previous step's field. That extra lag makes the explicit coupling
+   * slightly less stable than the CPU version, which is why the demo uses a
+   * heavy disk. Stated rather than hidden -- the CPU path in src/cpu/solid.js is
+   * the one the report's numbers come from, and it has no such lag.
+   */
+  async integrateSolid(dt) {
+    const d = this.solid;
+    if (!d || this._solidBusy) return;
+    this._solidBusy = true;
+    try {
+      const enc = this.device.createCommandEncoder();
+      enc.copyTextureToBuffer(
+        { texture: this.impulseTex },
+        { buffer: this.impulseRead, bytesPerRow: this.nx * 16, rowsPerImage: this.ny },
+        [this.nx, this.ny],
+      );
+      this.device.queue.submit([enc.finish()]);
+      await this.impulseRead.mapAsync(GPUMapMode.READ);
+      const raw = new Float32Array(this.impulseRead.getMappedRange());
+      const dA = this.dx * this.dy;
+      let fx = 0, fy = 0, tq = 0;
+      for (let i = 0; i < this.nx * this.ny; i++) {
+        fx += raw[i * 4]; fy += raw[i * 4 + 1]; tq += raw[i * 4 + 2];
+      }
+      this.impulseRead.unmap();
+
+      // Newton's third law: the body gets the negative of what the fluid got.
+      d.force = [-fx * dA / dt, -fy * dA / dt];
+      d.torque = -tq * dA / dt;
+      d.integrate(dt);
+
+      // Keep the body inside the periodic box so the mask wraps correctly.
+      const L = this.nx * this.dx;
+      d.x = ((d.x % L) + L) % L;
+      d.y = ((d.y % L) + L) % L;
+    } finally {
+      this._solidBusy = false;
+    }
+  }
+
   // -------------------------------------------------------------- the step
 
   /**
@@ -414,6 +517,10 @@ export class GPUFluidSolver {
       pass.end();
       this._swapVel();
     }
+
+    // --- immersed solid, BEFORE the projection: direct forcing introduces
+    //     divergence that the projection then clears.
+    this._encodeSolid(enc, dt);
 
     // --- projection
     this._encodeProjection(enc, dt);
@@ -696,6 +803,8 @@ export class GPUFluidSolver {
     this.mg?.destroy();
     this.forcingModes?.destroy();
     this.mcFwd?.destroy(); this.mcBack?.destroy();
+    this.impulseTex?.destroy(); this.solidBuf?.destroy();
+    this.impulseRead?.destroy();
     for (const t of [...this.vel, ...this.pressure, ...this.dye, this.div, this.output]) {
       t.destroy();
     }

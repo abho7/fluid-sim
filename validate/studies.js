@@ -18,6 +18,8 @@ import { taylorGreen, translatingGaussian, relL2, velocityErrorTG } from "../src
 import { velocityAtCenters, kineticEnergy } from "../src/core/grid.js";
 import { energySpectrum, fitSlope, convergenceOrder, parsevalCheck } from "../src/core/fft.js";
 import { advectScalarSL, advectScalarMacCormack } from "../src/cpu/advect.js";
+import { RigidDisk, applyCoupling, slipError, fluidMomentum } from "../src/cpu/solid.js";
+import { Grid } from "../src/core/grid.js";
 
 const SCHEMES = ["semi-lagrangian", "maccormack"];
 
@@ -581,4 +583,126 @@ export function spectrumStudy({
     finalEnstrophy: s.enstrophy(),
     maxDivergence: s.maxDivergence(),
   };
+}
+
+
+// ============================== 6. two-way fluid-structure interaction
+
+/**
+ * The immersed rigid disk: what the coupling conserves, and where it breaks.
+ *
+ * Three measurements, because "two-way coupling works" is three separate
+ * claims and they fail in different ways:
+ *
+ *   1. Newton's third law -- the momentum the fluid gains is exactly what the
+ *      solid loses. Exact by construction, so measured to machine precision.
+ *   2. No-slip -- how well the fluid inside the body actually moves with it.
+ *      A single direct-forcing pass leaves (1 - chi); more passes drive it down
+ *      geometrically.
+ *   3. Stability -- explicit coupling diverges when the fluid's inertia rivals
+ *      the body's. Swept in both translation (density ratio) and rotation
+ *      (moment of inertia), because they have separate thresholds.
+ */
+export function fsiStudy({ n = 64, steps = 60, dt = 0.01 } = {}) {
+  const out = {};
+
+  // --- 1. momentum conservation, with and without the added-mass correction
+  out.momentum = {
+    note: "the coupling exchanges momentum exactly; the added-mass correction " +
+          "trades that exactness for stability, and is off by default",
+    points: [],
+  };
+  for (const addedMassCorrection of [false, true]) {
+    const g = new Grid(n, n);
+    const u = g.u().fill(1.2), v = g.v().fill(-0.4);
+    const d = new RigidDisk({ x: Math.PI, y: Math.PI, r: 0.7, density: 2, addedMassCorrection });
+    const [fx0, fy0] = fluidMomentum(g, u, v);
+    const [sx0, sy0] = d.momentum();
+    applyCoupling(g, u, v, [d], dt);
+    d.integrate(dt);
+    const [fx1, fy1] = fluidMomentum(g, u, v);
+    const [sx1, sy1] = d.momentum();
+    const before = Math.hypot(fx0 + sx0, fy0 + sy0) || 1;
+    out.momentum.points.push({
+      addedMassCorrection,
+      relativeDrift: Math.hypot((fx1 + sx1) - (fx0 + sx0), (fy1 + sy1) - (fy0 + sy0)) / before,
+    });
+  }
+
+  // --- 2. no-slip residual vs forcing passes
+  out.noSlip = {
+    note: "a direct-forcing pass moves the fluid a fraction chi toward the body, " +
+          "leaving (1 - chi); repeating drives it down geometrically",
+    points: [],
+  };
+  for (const passes of [1, 2, 3, 4]) {
+    const g = new Grid(96, 96);
+    const u = g.u().fill(1.0), v = g.v();
+    const d = new RigidDisk({ x: Math.PI, y: Math.PI, r: 0.9, fixed: true });
+    applyCoupling(g, u, v, [d], dt, { passes });
+    const e = slipError(g, u, v, d);
+    out.noSlip.points.push({ passes, maxSlip: e.max, meanSlip: e.mean, samples: e.samples });
+  }
+
+  // --- 3a. translational stability vs density ratio
+  const runTranslation = (density, addedMassCorrection) => {
+    const d = new RigidDisk({ x: Math.PI, y: Math.PI, r: 0.6, density, addedMassCorrection });
+    const s = new FluidSolver({
+      n, nu: 0, validation: true, projection: "fft", advection: "maccormack", solids: [d],
+    });
+    s.init(() => 1.0, () => 0);
+    for (let k = 0; k < steps; k++) {
+      s.step(dt, { advectDye: false });
+      if (!Number.isFinite(d.vx) || Math.abs(d.vx) > 50) {
+        return { blewUp: true, vx: null, atStep: k + 1 };
+      }
+    }
+    return { blewUp: false, vx: d.vx, atStep: null };
+  };
+  out.translationStability = {
+    note: "in 2D a disk's added mass equals the displaced fluid mass, so at a " +
+          "density ratio of 1 the fluid's inertia already equals the body's",
+    steps,
+    points: [0.1, 0.25, 0.5, 0.6, 0.8, 1.0, 1.2, 1.5, 2, 3, 5, 8].map(density => ({
+      density,
+      plain: runTranslation(density, false),
+      corrected: runTranslation(density, true),
+    })),
+  };
+  const stablePlain = out.translationStability.points.filter(p => !p.plain.blewUp);
+  const stableCorr = out.translationStability.points.filter(p => !p.corrected.blewUp);
+  out.translationStability.lowestStableDensity = {
+    plain: stablePlain.length ? Math.min(...stablePlain.map(p => p.density)) : null,
+    corrected: stableCorr.length ? Math.min(...stableCorr.map(p => p.density)) : null,
+  };
+
+  // --- 3b. rotational stability vs moment of inertia
+  out.rotationStability = {
+    note: "u = y - PI has vorticity -1; a torque-free body should approach " +
+          "omega = -0.5, half the vorticity",
+    steps,
+    points: [],
+  };
+  for (const density of [1.5, 3, 10, 50, 200, 1000]) {
+    const d = new RigidDisk({ x: Math.PI, y: Math.PI, r: 0.5, density });
+    const s = new FluidSolver({
+      n, nu: 0, validation: true, projection: "fft", advection: "maccormack", solids: [d],
+    });
+    s.init((x, y) => y - Math.PI, () => 0);
+    let blew = false;
+    for (let k = 0; k < steps; k++) {
+      s.step(dt, { advectDye: false });
+      if (!Number.isFinite(d.omega) || Math.abs(d.omega) > 10) { blew = true; break; }
+    }
+    out.rotationStability.points.push({
+      density, inertia: d.inertia, blewUp: blew,
+      omega: blew ? null : d.omega,
+      theoreticalLimit: -0.5,
+    });
+  }
+  const rotStable = out.rotationStability.points.filter(p => !p.blewUp);
+  out.rotationStability.lowestStableInertia =
+    rotStable.length ? Math.min(...rotStable.map(p => p.inertia)) : null;
+
+  return out;
 }

@@ -46,6 +46,12 @@ button:hover{border-color:var(--accent);color:var(--accent)}
   background:var(--panel);border:1px solid var(--line);border-radius:999px;
   padding:.42rem .85rem;backdrop-filter:blur(14px)}
 .links a:hover{color:var(--accent);border-color:var(--accent)}
+#overlay{position:fixed;z-index:5;display:none;border:2px solid rgba(255,255,255,.55);
+  border-radius:50%;pointer-events:none;box-shadow:0 0 24px rgba(0,0,0,.5) inset;
+  transform-origin:center}
+#overlay::after{content:"";position:absolute;left:50%;top:8%;width:2px;height:42%;
+  background:rgba(255,255,255,.5);transform-origin:bottom center;
+  transform:rotate(var(--spin,0rad))}
 #fallback{position:fixed;inset:0;display:none;place-items:center;padding:2rem;
   text-align:center;z-index:20;background:#05070a}
 #fallback div{max-width:34rem;color:var(--dim);font-size:.9rem;line-height:1.7}
@@ -83,6 +89,14 @@ button:hover{border-color:var(--accent);color:var(--accent)}
     <label for="iters">pressure</label>
     <input type="range" id="iters" min="1" max="8" step="1" value="3">
   </div>
+  <div class="row">
+    <label for="obstacle">obstacle</label>
+    <select id="obstacle">
+      <option value="0" selected>none</option>
+      <option value="1">free disk</option>
+      <option value="2">pinned disk</option>
+    </select>
+  </div>
   <div class="row" style="margin-top:.7rem">
     <button id="clear">clear</button>
     <button id="seed">seed vortices</button>
@@ -94,6 +108,7 @@ button:hover{border-color:var(--accent);color:var(--accent)}
     <span>fps</span><b id="s-fps">–</b>
     <span>max |∇·u|</span><b id="s-div">–</b>
     <span>cells</span><b id="s-cells">–</b>
+    <span>disk speed</span><b id="s-disk">–</b>
   </div>
 </div>
 
@@ -102,6 +117,7 @@ button:hover{border-color:var(--accent);color:var(--accent)}
   <a href="https://github.com/abho7/fluid-sim">source</a>
 </div>
 
+<div id="overlay" aria-hidden="true"></div>
 <div class="hint" id="hint">drag to push the fluid</div>
 
 <div id="fallback"><div>
@@ -127,6 +143,7 @@ button:hover{border-color:var(--accent);color:var(--accent)}
  * see the report's limitations section for why that separation matters.
  */
 import { createDevice, GPUFluidSolver } from "./src/gpu/solver.js";
+import { RigidDisk } from "./src/cpu/solid.js";
 
 const canvas = document.getElementById("c");
 const $ = id => document.getElementById(id);
@@ -192,6 +209,8 @@ async function init() {
     },
     seed: seedVortices,
     recalibrate,
+    setObstacle,
+    drawDisk,
   };
 
   requestAnimationFrame(frame);
@@ -210,6 +229,10 @@ function build(n) {
   });
   $("s-cells").textContent = (n * n).toLocaleString();
   buildBlit();
+  // Rebuilding for a resolution change creates a new solver, so the obstacle
+  // has to be re-attached or it would silently vanish from the UI's point of
+  // view while the dropdown still claimed it was there.
+  setObstacle(Number($("obstacle").value));
 }
 
 // ------------------------------------------------------------------- blit
@@ -335,6 +358,7 @@ function wire() {
   $("mode").onchange = e => { colourMode = Number(e.target.value); };
   $("conf").oninput = e => { gpu.confinement = Number(e.target.value); };
   $("iters").oninput = e => { gpu.pressureIterations = Number(e.target.value); };
+  $("obstacle").onchange = e => setObstacle(Number(e.target.value));
   $("clear").onclick = () => {
     const zero = new Float32Array(res * res * 4);
     gpu.uploadVelocity(new Float32Array(res * res), new Float32Array(res * res));
@@ -410,6 +434,51 @@ function seedVortices() {
   gpu.uploadDye(dye);
 }
 
+
+/**
+ * Attach or remove the immersed rigid disk.
+ *
+ * DENSITY 6, not 1. Explicit fluid-structure coupling diverges when the fluid's
+ * inertia rivals the body's, and in 2D a disk's added mass is exactly the fluid
+ * it displaces -- so a neutrally buoyant disk sits right on the threshold. The
+ * CPU study measured divergence at every density ratio below about 1.2; the GPU
+ * path is a little worse still because its force readback lags one step. A
+ * heavy disk stays comfortably inside the stable range.
+ *
+ * The report's fluid-structure numbers all come from the CPU path in
+ * src/cpu/solid.js, which has no such lag and conserves momentum to 1e-14.
+ */
+function setObstacle(mode) {
+  if (!gpu) return;
+  if (mode === 0) { gpu.setSolid(null); $("s-disk").textContent = "–"; return; }
+  gpu.setSolid(new RigidDisk({
+    x: Math.PI * 0.6, y: Math.PI,
+    r: 0.55,
+    density: 6,
+    fixed: mode === 2,
+  }));
+}
+
+/** Draw the disk's outline over the fluid, so the obstacle is visible. */
+function drawDisk() {
+  const d = gpu?.solid;
+  const ov = $("overlay");
+  if (!d) { ov.style.display = "none"; return; }
+  // "block", not "". An empty string REMOVES the inline style, which falls back
+  // to the stylesheet rule -- and that rule is display:none, so the overlay
+  // stayed invisible while every other part of the coupling worked.
+  ov.style.display = "block";
+  const r = canvas.getBoundingClientRect();
+  // Simulation space is [0, 2pi)^2 mapped onto the canvas, y flipped.
+  const px = (d.x / (2 * Math.PI)) * r.width;
+  const py = (1 - d.y / (2 * Math.PI)) * r.height;
+  const pr = (d.r / (2 * Math.PI)) * r.width;
+  ov.style.transform = `translate(${px - pr}px, ${py - pr}px)`;
+  ov.style.width = ov.style.height = `${pr * 2}px`;
+  // A spoke, so rotation is visible -- otherwise a spinning disk looks static.
+  ov.style.setProperty("--spin", `${d.omega}rad`);
+}
+
 function wrapd(d) {
   const L = 2 * Math.PI;
   return d - L * Math.round(d / L);
@@ -472,6 +541,11 @@ async function frame(now) {
     msAcc += performance.now() - t0;
   }
 
+  // The body's force comes from a readback, so it is integrated outside the
+  // step and lands one frame late. Fire-and-forget: awaiting it here would
+  // stall the frame on the GPU queue.
+  if (gpu.solid) { gpu.integrateSolid(1 / 90); drawDisk(); }
+
   gpu.render({ mode: colourMode, scale: colourMode === 0 ? vortScale : 1.4 });
   blit();
 
@@ -479,6 +553,9 @@ async function frame(now) {
   frames++; fpsAcc += dtReal;
   if (fpsAcc > 0.5) {
     $("s-fps").textContent = (frames / fpsAcc).toFixed(0);
+    if (gpu.solid) {
+      $("s-disk").textContent = Math.hypot(gpu.solid.vx, gpu.solid.vy).toFixed(3);
+    }
     $("s-ms").textContent = (msAcc / frames).toFixed(1);
     frames = 0; fpsAcc = 0; msAcc = 0;
   }

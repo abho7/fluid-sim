@@ -912,6 +912,171 @@ function gpuSection() {
   return `<section><div class="wrap">${parts.join("\n")}</div></section>`;
 }
 
+function fsiSection() {
+  const f = validation?.fsi;
+  if (!f) return "";
+
+  const slipPlot = plot({
+    series: [{
+      x: f.noSlip.points.map(p => p.passes),
+      y: f.noSlip.points.map(p => p.maxSlip),
+      label: "max slip inside the body", colour: PAL.accent, marker: true,
+    }],
+    xScale: "linear", yScale: "log", width: 640, height: 360,
+    xLabel: "direct-forcing passes per step", yLabel: "residual slip",
+    title: "How well the body actually blocks the flow",
+    caption: "One pass moves the fluid a fraction chi of the way to the body velocity, " +
+      "leaving (1 - chi) behind. Repeating drives the residual down by that same factor " +
+      "each time, which is a straight line on a log axis -- a property of the method " +
+      "rather than a tuned number.",
+  });
+
+  const ts = f.translationStability.points;
+  const stabPlot = plot({
+    series: [
+      { x: ts.filter(p => !p.plain.blewUp).map(p => p.density),
+        y: ts.filter(p => !p.plain.blewUp).map(p => p.plain.vx),
+        label: "no correction", colour: PAL.warm, marker: true },
+      { x: ts.filter(p => !p.corrected.blewUp).map(p => p.density),
+        y: ts.filter(p => !p.corrected.blewUp).map(p => p.corrected.vx),
+        label: "added-mass corrected", colour: PAL.good, marker: true },
+    ],
+    xScale: "log", yScale: "linear", width: 640, height: 360,
+    xLabel: "solid / fluid density ratio", yLabel: "disk velocity after the run",
+    title: "Where explicit coupling stops working",
+    caption: "Points appear only where the run stayed finite. Without the correction " +
+      "every ratio below " + f.translationStability.lowestStableDensity.plain +
+      " diverged; with it the sweep stayed stable down to " +
+      f.translationStability.lowestStableDensity.corrected + ", the lowest tried.",
+  });
+
+  const rotRows = f.rotationStability.points.map(p => [
+    td(num(p.density, 1), "num"),
+    td(num(p.inertia, 4), "num"),
+    td(p.blewUp ? '<span class="pill bad">diverged</span>' : num(p.omega, 4), "num"),
+    td("-0.5", "num"),
+  ]);
+
+  const mom = f.momentum.points;
+  const firstStable = f.rotationStability.points.find(p => !p.blewUp);
+
+  return `
+<section><div class="wrap">
+  <p class="eyebrow">fluid-structure interaction</p>
+  <h2>An obstacle that is pushed back</h2>
+  <div class="prose stack">
+    <p class="lede">
+      A rigid disk immersed in the flow, coupled both ways: it blocks the fluid,
+      and the reaction moves it. &ldquo;Two-way&rdquo; is the load-bearing word
+      &mdash; a static obstacle that deflects flow without ever moving is a
+      boundary condition, and a much easier thing to get right.
+    </p>
+    <p style="color:var(--ink2);font-size:.94rem">
+      The method is direct forcing (Mohd-Yusof 1997): the solid is a smoothed mask
+      on the existing grid, the fluid inside it is driven toward the body velocity
+      each step, and the reaction on the body is the negative of that same
+      integral. That last clause is where Newton&rsquo;s third law lives, and it is
+      the one thing here that can be checked exactly rather than approximately.
+    </p>
+  </div>
+
+  <div class="kpi">
+    ${kpi(num(mom[0].relativeDrift, 0), "momentum drift", "one coupling step, default path", "good")}
+    ${kpi(num(f.noSlip.points[f.noSlip.points.length - 1].maxSlip, 0), "residual slip",
+      `${f.noSlip.points[f.noSlip.points.length - 1].passes} forcing passes`, "good")}
+    ${kpi(String(f.translationStability.lowestStableDensity.plain), "min density ratio",
+      "below this the explicit coupling diverges", "warn")}
+    ${kpi(firstStable ? num(firstStable.omega, 3) : MISSING, "spin in shear",
+      "torque-free theory says -0.5")}
+  </div>
+
+  <div class="figs">${slipPlot}${stabPlot}</div>
+
+  <h3>Newton&rsquo;s third law, to machine precision</h3>
+  <p class="note">
+    The coupling moves momentum between fluid and solid and must not create or
+    destroy any. Applied correctly that is exact, so it is measured as such rather
+    than given a tolerance. A coupling that leaked momentum would still produce a
+    disk that moved plausibly, which is precisely why it needs a check that
+    &ldquo;looks about right&rdquo; cannot satisfy.
+  </p>
+  ${table(["configuration", { t: "relative momentum drift", num: 1 }, "verdict"], [
+    [td("default (exact)"), td(num(mom[0].relativeDrift, 0), "num"),
+     td('<span class="pill good">conserves</span>')],
+    [td("added-mass corrected"), td(num(mom[1].relativeDrift, 0), "num"),
+     td('<span class="pill warn">trades conservation for stability</span>')],
+  ])}
+
+  <div class="finding">
+    <h3>The correction is not free, so it is not the default</h3>
+    <dl>
+      <dt>the problem</dt><dd>Explicit coupling computes the force from the current
+        fluid state, applies it to the body, and lets the body change the fluid next
+        step. In 2D a disk&rsquo;s added mass is <em>exactly</em> the mass of fluid it
+        displaces, so at a density ratio of 1 the fluid&rsquo;s inertia already equals
+        the body&rsquo;s and that feedback loop diverges.</dd>
+      <dt>the usual fix</dt><dd>Fold the added mass into the effective inertia. It
+        works: the stable range extends from
+        ${f.translationStability.lowestStableDensity.plain} down to
+        ${f.translationStability.lowestStableDensity.corrected}.</dd>
+      <dt>the cost</dt><dd>The added mass <em>is</em> fluid mass, and the fluid&rsquo;s
+        momentum is already tracked in the fluid. Counting it again on the body makes
+        the body under-respond, and total momentum stops being conserved:
+        ${num(mom[1].relativeDrift, 0)} against ${num(mom[0].relativeDrift, 0)}.</dd>
+      <dt>the choice</dt><dd>Off by default, like vorticity confinement elsewhere in
+        this project. The convenient option exists, is labelled, and is not what any
+        number here is measured with.</dd>
+    </dl>
+  </div>
+
+  <h3>The GPU port computes the same thing</h3>
+  <p class="note">
+    The CPU implementation is the reference; the GPU one exists so the obstacle can
+    appear in the interactive demo. Given the same body in the same flow, the two agree
+    on the force to better than 0.01%, which is the check that matters &mdash; the force is the
+    whole coupling.
+  </p>
+  <div class="finding">
+    <h3>A bug the CPU version structurally could not have</h3>
+    <dl>
+      <dt>symptom</dt><dd>The GPU disk produced <code>NaN</code> velocity within a few
+        steps. 162,981 of 262,144 impulse cells came back non-finite &mdash; and every
+        one of them was <em>far</em> from the body, the region where the mask should
+        have been a clean zero.</dd>
+      <dt>cause</dt><dd>The mask is
+        <code>&frac12;(1 &minus; tanh((r &minus; R)/w))</code>, and with a mask width of
+        1.5 cells that argument reaches about 240 at the far side of the domain. WGSL
+        does not require <code>tanh</code> to be robust for large arguments, and this
+        adapter evidently computes it as
+        <code>(e&sup1; &minus; e&#8315;&sup1;)/(e&sup1; + e&#8315;&sup1;)</code>: both
+        terms overflow to infinity and the result is <code>Inf/Inf = NaN</code>.</dd>
+      <dt>why the CPU never showed it</dt><dd><code>Math.tanh</code> is robust. The
+        reference implementation was correct and silent, which is exactly the case a
+        port has to be tested for rather than trusted through.</dd>
+      <dt>fix</dt><dd>Clamp the argument to &plusmn;10 before <code>tanh</code>, which
+        saturates well inside f32 and changes no representable value. Pinned by a check
+        that asserts the whole impulse field is finite.</dd>
+    </dl>
+  </div>
+
+  <h3>Rotation has a separate threshold</h3>
+  <p class="note">
+    A shear flow <code>u = y &minus; &pi;</code> has vorticity &minus;1, and the
+    classical result for a torque-free body is rotation at half the vorticity,
+    &omega; &rarr; &minus;0.5. The coupling reproduces the sign and the approach
+    &mdash; but only once the moment of inertia is large enough. Below that it
+    diverges for the same reason translation does, at its own threshold.
+  </p>
+  ${table(["density", { t: "moment of inertia", num: 1 }, { t: "omega after the run", num: 1 },
+           { t: "theory", num: 1 }], rotRows)}
+  <p class="note">
+    Heavier bodies approach &minus;0.5 more slowly, which is the expected response to
+    a fixed torque, and none of these runs is long enough to arrive. What is asserted
+    is the sign and the direction of approach, not the endpoint.
+  </p>
+</div></section>`;
+}
+
 function bugsSection() {
   const bugs = [
     {
@@ -1035,6 +1200,16 @@ function limitsSection() {
     <li><strong>Integrated GPU.</strong> Every performance ratio on this page comes
       from an Intel iGPU sharing bandwidth with the CPU, which is the pessimistic end
       of the range.</li>
+    <li><strong>The fluid-structure coupling is explicit.</strong> It diverges below
+      a density ratio of about 1 without the added-mass correction, and the correction
+      costs exact momentum conservation. A strongly-coupled (iterated) scheme would fix
+      both and is not implemented.</li>
+    <li><strong>The GPU coupling lags one step.</strong> The force on the body is the
+      integral of the impulse field, which needs a readback, and awaiting it inside the
+      step would stall the pipeline. So the demo applies the previous step's force. That
+      extra lag makes the explicit coupling slightly less stable than the CPU path,
+      which is why the demo uses a heavy disk. Every fluid-structure number on this page
+      comes from the CPU path, which has no such lag.</li>
   </ul></div>
 </div></section>`;
 }
@@ -1091,6 +1266,7 @@ ${convergenceSection()}
 ${stabilitySection()}
 ${spectrumSection()}
 ${gpuSection()}
+${fsiSection()}
 ${bugsSection()}
 ${limitsSection()}
 ${reproduceSection()}

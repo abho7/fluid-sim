@@ -33,6 +33,7 @@ import { Grid, maxDivergence, divergence } from "../src/core/grid.js";
 import { taylorGreen } from "../src/core/analytic.js";
 import { FluidSolver } from "../src/cpu/solver.js";
 import { createDevice, GPUFluidSolver } from "../src/gpu/solver.js";
+import { RigidDisk } from "../src/cpu/solid.js";
 
 const out = document.getElementById("out");
 const lines = [];
@@ -263,14 +264,6 @@ async function main() {
   }
 
 
-  // Post to the collector so the report is built from a file rather than a
-  // screenshot of this page. Failure is non-fatal: the harness is still useful
-  // interactively when the collector is not running.
-  try {
-    await fetch("http://127.0.0.1:8932/gpu-verify", { method: "POST",
-      headers: { "Content-Type": "application/json" }, body: JSON.stringify(R) });
-    log("posted to results/gpu-verify.json", "ok");
-  } catch (e) { log("collector unreachable (results not saved)", "warn"); }
   // ------------------------------------------- 6. MacCormack matches the CPU
   // Ported to the GPU after the energy spectrum came out at -6.1 against
   // Kraichnan's -3, which the CPU measurements attributed to semi-Lagrangian's
@@ -333,7 +326,123 @@ async function main() {
     R.schemeEnergy = { ...ke, exact };
   }
 
+  // -------------------------------------- 8. immersed solid, on the GPU
+  //
+  // The CPU implementation is the validated reference (momentum conserved to
+  // 1e-14, both stability boundaries measured). These checks confirm the GPU
+  // port computes the same thing, and cover the one failure mode that the CPU
+  // version structurally cannot have: WGSL's tanh is not required to be robust
+  // for large arguments, and the mask evaluates it far from the body.
+  {
+    const M = 128;
+    const gpu = new GPUFluidSolver(device, {
+      n: M, nu: 0, pressureSolver: "multigrid", pressureIterations: 3,
+      advection: "maccormack", hasTimestamps,
+    });
+    gpu.setSolid(new RigidDisk({ x: Math.PI, y: Math.PI, r: 0.6, density: 8, fixed: true }));
+    gpu.uploadVelocity(new Float32Array(M * M).fill(1.0), new Float32Array(M * M));
+    gpu.step(dt);
+
+    const raw = await gpu.readTexture(gpu.impulseTex);
+    let sum = 0, nonFinite = 0, nonZero = 0;
+    for (let i = 0; i < M * M; i++) {
+      const a = raw[i * 4];
+      if (!Number.isFinite(a)) { nonFinite++; continue; }
+      sum += a;
+      if (Math.abs(a) > 1e-9) nonZero++;
+    }
+    const impulse = sum * gpu.dx * gpu.dy;
+
+    // The whole field must be finite. This is the regression on the tanh
+    // overflow: 162981 of 262144 cells came back NaN before the argument was
+    // clamped, and every one of them was FAR from the disk -- the region where
+    // the mask should have been a clean zero.
+    check("GPU solid mask is finite everywhere", nonFinite === 0,
+      `${nonFinite} non-finite cells of ${M * M} (was 162981/262144 before the tanh clamp)`);
+    check("GPU solid mask covers a plausible area",
+      nonZero > 100 && nonZero < M * M * 0.5,
+      `${nonZero} cells carry impulse`);
+    // A pinned disk in a +x stream must REMOVE x-momentum from the fluid.
+    check("a pinned disk slows the fluid", impulse < 0,
+      `net fluid impulse ${impulse.toExponential(2)} (negative expected)`);
+    R.gpuSolid = { impulse, nonFinite, nonZero, n: M };
+    gpu.destroy();
+  }
+
+  // ------------------------------ 9. GPU solid agrees with the CPU reference
+  {
+    const M = 128;
+    const mkDisk = () => new RigidDisk({ x: Math.PI, y: Math.PI, r: 0.6, density: 8, fixed: true });
+
+    const cpuDisk = mkDisk();
+    const cpu = new FluidSolver({
+      n: M, nu: 0, validation: true, projection: "fft", advection: "maccormack",
+      solids: [cpuDisk], couplingPasses: 1,
+    });
+    cpu.init(() => 1.0, () => 0);
+    cpu.step(dt, { advectDye: false });
+
+    const gpuDisk = mkDisk();
+    const gpu = new GPUFluidSolver(device, {
+      n: M, nu: 0, pressureSolver: "multigrid", pressureIterations: 4,
+      advection: "maccormack", hasTimestamps,
+    });
+    gpu.setSolid(gpuDisk);
+    gpu.uploadVelocity(new Float32Array(M * M).fill(1.0), new Float32Array(M * M));
+    gpu.step(dt);
+    await gpu.integrateSolid(dt);
+
+    const { u, v } = await gpu.readVelocity();
+    const du = relDiff(u, cpu.u), dv = relDiff(v, cpu.v);
+
+    // The forces are computed by the same integral on both sides, so they
+    // should agree to f32 precision even though the fields differ slightly.
+    const fCpu = cpuDisk.force[0], fGpu = gpuDisk.force[0];
+    const fRel = Math.abs(fGpu - fCpu) / (Math.abs(fCpu) || 1);
+
+    check("GPU solid coupling matches the CPU field", Math.max(du, dv) < 5e-3,
+      `relL2 u=${du.toExponential(2)} v=${dv.toExponential(2)}`);
+    check("GPU and CPU agree on the force the body feels", fRel < 5e-2,
+      `CPU ${fCpu.toExponential(3)} vs GPU ${fGpu.toExponential(3)} (${(fRel * 100).toFixed(1)}%)`);
+    R.gpuSolidAgreement = { du, dv, fCpu, fGpu, fRel };
+    gpu.destroy();
+  }
+
+  // ----------------------------------- 10. a free disk is pushed downstream
+  {
+    const M = 128;
+    const disk = new RigidDisk({ x: Math.PI, y: Math.PI, r: 0.55, density: 8 });
+    const gpu = new GPUFluidSolver(device, {
+      n: M, nu: 0, pressureSolver: "multigrid", pressureIterations: 3,
+      advection: "maccormack", hasTimestamps,
+    });
+    gpu.setSolid(disk);
+    gpu.uploadVelocity(new Float32Array(M * M).fill(1.0), new Float32Array(M * M));
+    const x0 = disk.x;
+    for (let k = 0; k < 60; k++) {
+      gpu.step(dt);
+      await gpu.integrateSolid(dt);
+    }
+    check("a free disk is carried downstream by the flow",
+      Number.isFinite(disk.vx) && disk.vx > 0.02 && disk.vx < 1.05,
+      `vx = ${Number.isFinite(disk.vx) ? disk.vx.toFixed(4) : "NaN"}, ` +
+      `moved ${(disk.x - x0).toFixed(4)}`);
+    R.gpuSolidFree = { vx: disk.vx, vy: disk.vy, moved: disk.x - x0 };
+    gpu.destroy();
+  }
+
   R.done = true;
+
+  // Posted LAST, after every check has run. An earlier version sat halfway up
+  // this function and captured only the checks above it -- the published report
+  // was missing the MacCormack rows entirely, and nothing about the page said so
+  // because the page itself displayed all of them.
+  try {
+    await fetch("http://127.0.0.1:8932/gpu-verify", { method: "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify(R) });
+    log("posted to results/gpu-verify.json", "ok");
+  } catch (e) { log("collector unreachable (results not saved)", "warn"); }
+
   const passed = R.checks.filter(c => c.pass).length;
   log(`\n${passed}/${R.checks.length} checks passed`,
     passed === R.checks.length ? "ok" : "bad");
