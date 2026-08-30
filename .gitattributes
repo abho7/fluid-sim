@@ -1,0 +1,7 @@
+# report.html is emitted by tools/build_report.py from the JSON in results/.
+# Committed because Pages serves it, but it is not source, and a regenerated
+# report should not read as a 100 KB hand edit in a diff.
+report.html linguist-generated=true
+
+# index.html and tools/*.html are hand-written, so they are not listed: the demo
+# page and the GPU test harnesses are as much source as the WGSL is.
