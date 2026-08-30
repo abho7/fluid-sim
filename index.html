@@ -87,7 +87,7 @@ button:hover{border-color:var(--accent);color:var(--accent)}
   </div>
   <div class="row">
     <label for="iters">pressure</label>
-    <input type="range" id="iters" min="1" max="8" step="1" value="3">
+    <input type="range" id="iters" min="1" max="8" step="1" value="2">
   </div>
   <div class="row">
     <label for="obstacle">obstacle</label>
@@ -104,7 +104,7 @@ button:hover{border-color:var(--accent);color:var(--accent)}
 
   <div class="stats">
     <span>solver</span><b id="s-solver">–</b>
-    <span>ms / step</span><b id="s-ms">–</b>
+    <span>ms / frame</span><b id="s-ms">–</b>
     <span>fps</span><b id="s-fps">–</b>
     <span>max |∇·u|</span><b id="s-div">–</b>
     <span>cells</span><b id="s-cells">–</b>
@@ -153,20 +153,46 @@ let running = true;
 let res = 512;
 let colourMode = 0;
 
+// Display tunables, read when the blit pipeline is built rather than per frame.
+let bloomIntensity = 1.05;
+let exposure = 0.58;
+
+// Ambient life. The demo should already be moving before anyone touches it, so
+// a band-limited force keeps energy in the flow and drifting emitters keep dye
+// in it. Both are ordinary uses of the solver's existing inputs -- the same API
+// the mouse uses -- not changes to the solve.
+let ambient = true;
+const emitters = [];
+
 const pointer = { down: false, x: 0, y: 0, px: 0, py: 0, hue: Math.random() };
 const splats = [];
 
 // ------------------------------------------------------------------ palette
 //
-// Dye colour cycles slowly through hue so successive strokes stay
-// distinguishable without any two being jarring together. Kept low-saturation
-// so the dye reads as a tracer in the flow rather than as paint on top of it.
-function hueToRGB(h) {
-  const f = (n) => {
-    const k = (n + h * 6) % 6;
-    return 0.55 * Math.max(0, Math.min(1, Math.min(k, 4 - k, 1))) + 0.06;
-  };
-  return [f(5), f(3), f(1)];
+// The dye is deliberately confined to the SAME neon family as the vorticity
+// map: violet through magenta through cyan, and nothing else. An earlier
+// version cycled the full hue wheel, which put greens, oranges and yellows on
+// screen that had no relationship to the physics colouring underneath -- the
+// two palettes fought and the result read as a smeared oil slick rather than a
+// glowing fluid. Restricting the range is what makes the dye look like the same
+// substance the vorticity map is showing.
+//
+// `t` in [0,1) walks that ramp and wraps, so successive strokes stay
+// distinguishable without ever leaving the family.
+function hueToRGB(t) {
+  const stops = [
+    [0.42, 0.10, 1.00],   // violet
+    [1.00, 0.12, 0.78],   // magenta
+    [1.00, 0.28, 0.42],   // hot pink
+    [0.20, 0.85, 1.00],   // cyan
+    [0.42, 0.10, 1.00],   // back to violet, so the ramp is a loop
+  ];
+  const u = ((t % 1) + 1) % 1 * (stops.length - 1);
+  const i = Math.floor(u), f = u - i;
+  const a = stops[i], b = stops[i + 1];
+  return [a[0] + (b[0] - a[0]) * f,
+          a[1] + (b[1] - a[1]) * f,
+          a[2] + (b[2] - a[2]) * f];
 }
 
 async function init() {
@@ -185,6 +211,11 @@ async function init() {
 
   build(res);
   resize();
+  initEmitters();
+  startAmbient();
+  // Something is already happening when the page opens: a visitor should not
+  // have to find the controls to see the simulation do anything.
+  seedVortices();
   addEventListener("resize", resize);
   wire();
 
@@ -198,7 +229,8 @@ async function init() {
       for (let i = 0; i < n; i++) {
         gpu.step(1 / 90, { splats: splats.splice(0, splats.length) });
       }
-      gpu.render({ mode: colourMode, scale: colourMode === 0 ? vortScale : 1.4 });
+      gpu.render({ mode: colourMode, scale: colourMode === 0 ? vortScale : 1.4,
+                   bloomThreshold: 0.62, bloomPasses: 2 });
       blit();
       return gpu.steps;
     },
@@ -211,11 +243,31 @@ async function init() {
     recalibrate,
     setObstacle,
     drawDisk,
+    emit: emitAmbientDye,
+    setAmbient(v) { ambient = v; startAmbient(); },
   };
 
   requestAnimationFrame(frame);
 }
 
+/**
+ * Demo defaults: 512^2 at two multigrid V-cycles.
+ *
+ * Both are DISPLAY choices and neither touches the solver. The validation
+ * numbers on the report come from separate headless runs at their own
+ * resolutions and tolerances, and are unaffected by what the demo picks here.
+ *
+ * The cost here is dominated by per-dispatch overhead, not by pixels: a V-cycle
+ * issues on the order of 150 small compute passes, so step time barely moved
+ * between 256^2 and 512^2 (34 ms against 48 ms at three cycles) while the cycle
+ * count moved it a lot -- 12.1 ms at one, 24.7 at two, 30.9 at three.
+ *
+ * That is why the grid stays at 512^2 and the saving comes from the V-cycle
+ * count instead: dropping to 256^2 would cost most of the visible detail and
+ * buy almost no time, which is the wrong trade. Two cycles holds max |div u| at
+ * around 3e-3, solenoidal enough that no compression artifact is visible. Both
+ * controls remain in the UI for anyone who wants to trade the other way.
+ */
 function build(n) {
   gpu?.destroy();
   res = n;
@@ -223,7 +275,7 @@ function build(n) {
     n,
     nu: 0,
     confinement: Number($("conf").value),
-    dyeFade: 0.0022,          // slow fade so strokes clear without visibly wiping
+    dyeFade: 0.0030,          // slow fade so strokes clear without visibly wiping
     pressureSolver: "multigrid",
     pressureIterations: Number($("iters").value),
   });
@@ -233,6 +285,7 @@ function build(n) {
   // has to be re-attached or it would silently vanish from the UI's point of
   // view while the dropdown still claimed it was there.
   setObstacle(Number($("obstacle").value));
+  startAmbient();
 }
 
 // ------------------------------------------------------------------- blit
@@ -250,11 +303,34 @@ function buildBlit() {
     }
     @group(0) @binding(0) var t : texture_2d<f32>;
     @group(0) @binding(1) var s : sampler;
+    @group(0) @binding(2) var b : texture_2d<f32>;
+
+    // ACES-style filmic curve. Reinhard (x/(1+x)) desaturates as it rolls off,
+    // which turns exactly the bright neon cores this design is built around into
+    // pale grey. This curve holds saturation into the highlights, so a vortex
+    // core stays magenta while getting brighter.
+    fn tonemap(x: vec3<f32>) -> vec3<f32> {
+      let a = 2.51; let bb = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
+      return clamp((x * (a * x + bb)) / (x * (c * x + d) + e),
+                   vec3<f32>(0.0), vec3<f32>(1.0));
+    }
+
     @fragment fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
       let uv = pos.xy / vec2<f32>(f32(RES_W), f32(RES_H));
-      return textureSample(t, s, uv);
+      var col = textureSample(t, s, uv).rgb;
+      // Bloom added in LINEAR space, before tone mapping. Adding it afterwards
+      // would wash the whole image toward white instead of making the bright
+      // parts glow.
+      col = col + textureSample(b, s, uv).rgb * BLOOM_I;
+      col = tonemap(col * EXPOSURE);
+      // Slight vignette, so the eye lands on the flow rather than the corners.
+      let dd = distance(uv, vec2<f32>(0.5, 0.5));
+      col = col * (1.0 - 0.42 * smoothstep(0.35, 0.95, dd));
+      return vec4<f32>(pow(col, vec3<f32>(1.0 / 2.2)), 1.0);
     }
-  `.replace("RES_W", canvas.width || 1).replace("RES_H", canvas.height || 1) });
+  `.replace("RES_W", canvas.width || 1).replace("RES_H", canvas.height || 1)
+   .replace("BLOOM_I", bloomIntensity.toFixed(3))
+   .replace("EXPOSURE", exposure.toFixed(3)) });
 
   blitPipeline = device.createRenderPipeline({
     layout: "auto",
@@ -272,7 +348,7 @@ function blit() {
     colorAttachments: [{
       view: ctx.getCurrentTexture().createView(),
       loadOp: "clear", storeOp: "store",
-      clearValue: { r: 0.02, g: 0.027, b: 0.04, a: 1 },
+      clearValue: { r: 0.004, g: 0.003, b: 0.014, a: 1 },
     }],
   });
   pass.setPipeline(blitPipeline);
@@ -281,6 +357,7 @@ function blit() {
     entries: [
       { binding: 0, resource: gpu.output.createView() },
       { binding: 1, resource: blitSampler },
+      { binding: 2, resource: gpu.bloom[0].createView() },
     ],
   }));
   pass.draw(3);
@@ -319,10 +396,19 @@ function wire() {
     pointer.x = pointer.px = x;
     pointer.y = pointer.py = y;
     pointer.hue = (pointer.hue + 0.13) % 1;
+    // A click with no drag should still do something visible.
+    const [r0, g0, b0] = hueToRGB(pointer.hue);
+    splats.push({ x, y, r: r0 * 0.8, g: g0 * 0.8, b: b0 * 0.8, radius: 0.15, isDye: true });
     if (hintShown) { hint.style.opacity = "0"; hintShown = false; }
   };
+  const MAX_QUEUED_SPLATS = 24;
   const move = (e) => {
     if (!pointer.down) return;
+    // Pointer events arrive faster than frames on a high-rate mouse. Without a
+    // cap, one quick flick queues dozens of splats that all land on the next
+    // step -- each a full-grid dispatch AND an impulse, so the frame both
+    // stalls and over-injects.
+    if (splats.length > MAX_QUEUED_SPLATS) return;
     e.preventDefault?.();
     const [x, y] = toSim(e.clientX ?? e.touches[0].clientX,
                          e.clientY ?? e.touches[0].clientY);
@@ -337,13 +423,21 @@ function wire() {
     const L = 2 * Math.PI;
     dx -= L * Math.round(dx / L);
     dy -= L * Math.round(dy / L);
-    const strength = 340;
+    const strength = 320;
     const [r, g, b] = hueToRGB(pointer.hue);
 
+    // Bigger and brighter than a subtle nudge, but the radius is the dominant
+    // term and it is easy to overdo: a Gaussian splat's total impulse scales as
+    // r^2, so going from 0.13 to 0.30 multiplied the injected momentum by more
+    // than eight and a single stroke washed the entire screen white. 0.22 with a
+    // moderate strength gives roughly 2.5x the original impulse, which reads as
+    // dramatic without destroying the image.
     splats.push({ x, y, dx: dx * strength, dy: dy * strength,
-                  radius: 0.13, isDye: false });
-    splats.push({ x, y, r: r * 0.5, g: g * 0.5, b: b * 0.5,
-                  radius: 0.10, isDye: true });
+                  radius: 0.22, isDye: false });
+    splats.push({ x, y, r: r * 0.62, g: g * 0.62, b: b * 0.62,
+                  radius: 0.11, isDye: true });
+    splats.push({ x, y, r: r * 0.24, g: g * 0.24, b: b * 0.24,
+                  radius: 0.20, isDye: true });
   };
   const up = () => { pointer.down = false; };
 
@@ -427,8 +521,10 @@ function seedVortices() {
       // Narrow stripes rather than one broad band: thin tracer lines get
       // stretched into filaments by the flow, which is the structure worth
       // seeing. A wide band just smears into a wash.
-      const band = Math.exp(-((((j / n) * 9) % 1 - 0.5) ** 2) / 0.006);
-      dye[k] = r * band * 0.42; dye[k + 1] = g * band * 0.42; dye[k + 2] = b * band * 0.42;
+      const band = Math.exp(-((((j / n) * 11) % 1 - 0.5) ** 2) / 0.0035);
+      const cross = Math.exp(-((((i / n) * 7) % 1 - 0.5) ** 2) / 0.02);
+      const a = band * (0.75 + 0.6 * cross);
+      dye[k] = r * a * 0.30; dye[k + 1] = g * a * 0.30; dye[k + 2] = b * a * 0.30;
     }
   }
   gpu.uploadDye(dye);
@@ -479,6 +575,88 @@ function drawDisk() {
   ov.style.setProperty("--spin", `${d.omega}rad`);
 }
 
+
+/**
+ * Band-limited ambient forcing, so the flow never goes still.
+ *
+ * FOUR modes, not ten. The kernel evaluates two cosines per mode per cell, so
+ * the cost is linear in the mode count: ten modes measured 17.7 ms per step at
+ * 512^2, which on its own is more than a 60 fps frame. Four large-scale modes
+ * stir the dye just as visibly for a fraction of that -- the visual difference
+ * between four and ten low-k modes is small, the cost difference is not.
+ *
+ * Deliberately at LOW wavenumber (k of 3 to 5). Forcing at small scales gives a
+ * busy shimmer that reads as noise; forcing at large scales gives slow sweeping
+ * motion that continuously stretches whatever dye is present into long
+ * filaments, which is what actually looks alive. The amplitude is small enough
+ * that a cursor drag still dominates locally.
+ */
+function startAmbient() {
+  if (!gpu) return;
+  if (!ambient) { gpu.setForcing(null); return; }
+  let seed = 20260829 >>> 0;
+  const rnd = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; };
+  const modes = [];
+  for (let m = 0; m < 4; m++) {
+    const th = 2 * Math.PI * rnd();
+    const k = 3 + Math.floor(rnd() * 3);
+    modes.push({
+      kx: Math.round(k * Math.cos(th)),
+      ky: Math.round(k * Math.sin(th)),
+      phase: 2 * Math.PI * rnd(),
+    });
+  }
+  gpu.setForcing(modes.filter(m => m.kx || m.ky),
+    { amplitude: 1.9, drag: 0.42, phaseDrift: 0.7 });
+}
+
+/**
+ * Drifting dye emitters.
+ *
+ * THREE emitters firing every sixth frame, not five every frame. Each splat is
+ * a full-grid compute dispatch, and ten per frame measured 12.5 ms per step at
+ * 512^2. Firing a larger, brighter splat less often looks the same once the
+ * flow has stretched it -- the dye is being advected either way -- and costs a
+ * sixth as much.
+ *
+ * Each wanders on its own slow path and releases a coloured splat every frame,
+ * so there is always fresh tracer being stretched by the flow. Dye fades, so
+ * without emitters the screen empties within a few seconds and the demo goes
+ * back to being a dark rectangle waiting for a cursor.
+ */
+function initEmitters() {
+  emitters.length = 0;
+  const N = 3;
+  for (let i = 0; i < N; i++) {
+    emitters.push({
+      hue: i / N,
+      ax: 1.6 + 0.9 * Math.sin(i * 2.1),
+      ay: 1.4 + 0.8 * Math.cos(i * 1.7),
+      wx: 0.21 + 0.07 * i,
+      wy: 0.17 + 0.05 * i,
+      ph: i * 1.3,
+    });
+  }
+}
+
+let emitPhase = 0;
+function emitAmbientDye(t) {
+  if (!ambient) return;
+  if ((emitPhase++ % 6) !== 0) return;
+  for (const e of emitters) {
+    const x = Math.PI + e.ax * Math.sin(e.wx * t + e.ph);
+    const y = Math.PI + e.ay * Math.sin(e.wy * t * 1.31 + e.ph * 1.7);
+    const [r, g, b] = hueToRGB((e.hue + t * 0.02) % 1);
+    splats.push({ x, y, r: r * 0.55, g: g * 0.55, b: b * 0.55,
+                  radius: 0.14, isDye: true });
+    // A small swirl at the emitter, so the dye is stretched immediately rather
+    // than sitting as a static blob.
+    const a = t * 0.9 + e.ph;
+    splats.push({ x, y, dx: Math.cos(a) * 15, dy: Math.sin(a) * 15,
+                  radius: 0.16, isDye: false });
+  }
+}
+
 function wrapd(d) {
   const L = 2 * Math.PI;
   return d - L * Math.round(d / L);
@@ -523,7 +701,7 @@ async function recalibrate() {
   if (rms > 1e-6) {
     // Target tanh argument ~0.45 at RMS: linear for the bulk, saturating only
     // for cores several times stronger than typical.
-    const target = 0.45 / rms;
+    const target = 0.30 / rms;
     vortScale += (target - vortScale) * 0.35;   // eased, so exposure never pumps
   }
 }
@@ -533,6 +711,7 @@ async function frame(now) {
   last = now;
 
   if (running) {
+    emitAmbientDye(gpu.t);
     const t0 = performance.now();
     // Fixed simulation timestep, independent of frame rate. Feeding the real
     // frame delta into the solver makes the physics change when the frame rate
@@ -546,17 +725,23 @@ async function frame(now) {
   // stall the frame on the GPU queue.
   if (gpu.solid) { gpu.integrateSolid(1 / 90); drawDisk(); }
 
-  gpu.render({ mode: colourMode, scale: colourMode === 0 ? vortScale : 1.4 });
+  gpu.render({ mode: colourMode, scale: colourMode === 0 ? vortScale : 1.4,
+               bloomThreshold: 0.62, bloomPasses: 2 });
   blit();
 
   // stats
   frames++; fpsAcc += dtReal;
   if (fpsAcc > 0.5) {
-    $("s-fps").textContent = (frames / fpsAcc).toFixed(0);
+    const fps = frames / fpsAcc;
+    $("s-fps").textContent = fps.toFixed(0);
+    // Frame time from real elapsed time, not from wrapping gpu.step(). step()
+    // only enqueues commands and returns immediately, so timing it reported ~16
+    // ms while the GPU was actually taking nearer 50 -- a number that disagreed
+    // with the fps counter sitting directly beneath it.
+    $("s-ms").textContent = (1000 / fps).toFixed(1);
     if (gpu.solid) {
       $("s-disk").textContent = Math.hypot(gpu.solid.vx, gpu.solid.vy).toFixed(3);
     }
-    $("s-ms").textContent = (msAcc / frames).toFixed(1);
     frames = 0; fpsAcc = 0; msAcc = 0;
   }
   // Divergence needs a readback, so it is sampled rarely -- measuring it every

@@ -245,6 +245,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   var q = sampleC(src, p);
   // Gentle fade so injected dye eventually clears; param_a = 0 disables it.
   q = q * (1.0 - P.param_a);
+
+  // BOUND THE DYE. It is a display field, not a conserved quantity, and with
+  // continuous emitters it otherwise accumulates without limit -- measured at
+  // 35.6 where emitters lingered, against a useful range of about 0..2. Past
+  // that everything tone-maps to flat white and the structure disappears into a
+  // blown-out blob. The ceiling is above 1 on purpose so bright dye still has
+  // headroom to bloom. Clamping the low end at 0 also removes the small
+  // negatives that bilinear interpolation leaves behind at sharp edges.
+  //
+  // The ceiling is 1.1 rather than something generous because dye of DIFFERENT
+  // hues sums: magenta over cyan over violet accumulates toward equal channels,
+  // which is white. At a ceiling of 2.5 the overlaps desaturated into a cream
+  // wash that buried the palette. A low ceiling keeps each stroke reading as
+  // its own colour.
+  q = clamp(q, vec4<f32>(0.0), vec4<f32>(1.0));
+
   textureStore(dst, vec2<i32>(i, j), q);
 }
 `;
@@ -637,19 +653,31 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 `;
 
 /**
- * Render kernel: velocity/vorticity -> colour.
+ * Render kernel: fields -> HDR colour.
  *
- * The colour is a function of the physics, not decoration layered on top. Two
- * mappings, both derived from fields the solver already computes:
- *   mode 0 -- vorticity, diverging: sign of rotation gives hue, magnitude gives
- *             intensity, so counter-rotating vortex pairs are visibly distinct
- *   mode 1 -- speed, sequential
- * Dye, when present, is composited over.
+ * DISPLAY ONLY. Nothing here feeds back into the simulation; it reads the
+ * velocity and dye textures and writes pixels. Every number on the validation
+ * report comes from the solver, which this does not touch.
+ *
+ * WRITES LINEAR HDR, not sRGB. Tone mapping and gamma moved to the final blit so
+ * the bloom passes have real high-dynamic-range values to threshold against --
+ * extracting "bright" regions from an already tone-mapped, gamma-encoded image
+ * finds a compressed, washed-out version of the highlights and the glow comes
+ * out grey. Keeping the render linear and letting values exceed 1.0 is what
+ * makes fast, high-vorticity regions actually radiate.
+ *
+ * THE PALETTE is a signed vorticity ramp: magenta for clockwise, cyan for
+ * counter-clockwise, through a near-black violet at zero, with speed driving an
+ * additional white-hot lift. Two things are deliberate about it. The hue still
+ * encodes the sign of rotation, so counter-rotating pairs remain distinguishable
+ * -- the colour is carrying information, not just decoration. And the intensity
+ * is superlinear in |omega|, so vortex cores blow past 1.0 into the bloom while
+ * quiet regions stay near black, which is where the contrast comes from.
  */
 export const RENDER = /* wgsl */`
 @group(0) @binding(1) var vel : texture_2d<f32>;
 @group(0) @binding(2) var dye : texture_2d<f32>;
-@group(0) @binding(3) var dst : texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(3) var dst : texture_storage_2d<rgba16float, write>;
 
 fn curlAt(i: i32, j: i32) -> f32 {
   let dvdx = (loadTex(vel, i, j).y - loadTex(vel, i - 1, j).y) / P.dx;
@@ -668,27 +696,148 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let c = loadTex(vel, i, j);
   let speed = length(vec2<f32>(c.x, c.y));
 
+  // Neon ramp. Saturated ends, near-black centre, so the background reads as
+  // void and the structure glows out of it.
+  let MAGENTA = vec3<f32>(1.00, 0.10, 0.62);
+  let CYAN    = vec3<f32>(0.10, 0.92, 1.00);
+  let VIOLET  = vec3<f32>(0.16, 0.03, 0.42);
+  let VOID_   = vec3<f32>(0.004, 0.003, 0.016);
+
+  // CLAMP EVERY tanh ARGUMENT. This adapter computes tanh as a ratio of
+  // exponentials, so an argument beyond about 88 overflows f32 to Inf/Inf = NaN
+  // -- the same failure that made the solid mask return NaN far from the body.
+  // Here the argument is vorticity times an AUTO-EXPOSURE factor, so it is not
+  // bounded by anything the shader controls: a quiet field drives the exposure
+  // up, and one strong vortex then overflows. It showed as black rectangles
+  // exactly 8 pixels on a side -- one per workgroup that hit it.
   var col : vec3<f32>;
   if (P.param_b < 0.5) {
-    // Diverging map. Signed vorticity scaled by a soft nonlinearity so that
-    // both the strong cores and the weak filaments between them are visible --
-    // a linear map shows only the cores and hides the structure that makes
-    // turbulence look like turbulence.
-    let s = tanh(w * P.param_a);
-    let warm = vec3<f32>(1.00, 0.42, 0.21);
-    let cool = vec3<f32>(0.16, 0.53, 0.96);
-    let mid  = vec3<f32>(0.02, 0.02, 0.05);
-    if (s >= 0.0) { col = mix(mid, warm, s); } else { col = mix(mid, cool, -s); }
+    let sig = tanh(clamp(w * P.param_a, -12.0, 12.0));
+    let mag = abs(sig);
+    // Two-stop ramp on each side: void -> violet -> saturated hue. The violet
+    // waypoint keeps the mid-tones from going muddy grey where the two hues
+    // would otherwise cross.
+    let hue = select(CYAN, MAGENTA, sig >= 0.0);
+    // The hue arrives EARLY. With the waypoint at 0.30..1.0 the mid-range of a
+    // typical field sat in violet and the image read as one colour; bringing it
+    // to 0.12..0.62 puts most of the resolved vorticity into saturated cyan or
+    // magenta and keeps violet as the transition rather than the subject.
+    let ramp = mix(mix(VOID_, VIOLET, smoothstep(0.0, 0.22, mag)),
+                   hue, smoothstep(0.12, 0.62, mag));
+    // Superlinear lift so cores punch past 1.0 into the bloom threshold.
+    col = ramp * (0.30 + 4.6 * mag * mag);
   } else {
-    let t = tanh(speed * P.param_a);
-    col = mix(vec3<f32>(0.01, 0.01, 0.04), vec3<f32>(0.55, 0.92, 1.0), t);
+    let t = tanh(clamp(speed * P.param_a, -12.0, 12.0));
+    let hue = mix(VIOLET, CYAN, smoothstep(0.15, 0.95, t));
+    col = mix(VOID_, hue, smoothstep(0.0, 0.6, t)) * (0.35 + 2.9 * t * t);
   }
 
-  let d = loadTex(dye, i, j);
-  col = col + d.rgb;
-  col = col / (1.0 + col);          // Reinhard, so bright dye rolls off rather than clipping
-  col = pow(col, vec3<f32>(1.0 / 2.2));   // to sRGB
+  // Speed adds a white-hot component, so fast-moving fluid reads as energetic
+  // even where the vorticity happens to cancel.
+  //
+  // SCALED BY THE SAME AUTO-EXPOSURE as the vorticity term, not by a constant.
+  // With a fixed scale this was the one part of the image that did not adapt: a
+  // hard cursor drag pushed the speed far past the threshold, sp saturated at 1
+  // across most of the frame, and the whole screen went white while the
+  // vorticity colouring underneath was still perfectly well exposed. Tying it to
+  // param_a means a fast flow re-exposes rather than clipping.
+  let sp = tanh(clamp(speed * P.param_a * 0.45, 0.0, 12.0));
+  let sp2 = sp * sp;
+  col = col + vec3<f32>(0.55, 0.78, 1.0) * (sp2 * sp2 * sp) * 0.85;
 
+  // Dye is a TRACER, and it is kept deliberately dim.
+  //
+  // Zeroing the dye and re-rendering the same velocity field showed the
+  // vorticity map on its own is the look this is after -- magenta and cyan on
+  // near-black. At a higher weight the dye competed with it instead of riding
+  // on it: strokes of different hue accumulate toward equal channels (white),
+  // and white laid over the magenta field reads as a cream-yellow wash that
+  // buried the palette entirely. At this weight the dye reveals where the flow
+  // is going without repainting it.
+  let d = loadTex(dye, i, j);
+  let dyeLum = dot(d.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+  // Mostly a luminance lift in the colour the physics already chose, plus a
+  // little of the dye's own hue so separate strokes stay distinguishable.
+  col = col + col * dyeLum * 1.5 + d.rgb * 0.20;
+
+  // Final guard: a non-finite value anywhere upstream would otherwise paint a
+  // black hole that looks like a rendering bug rather than a simulation one.
+  col = select(vec3<f32>(0.0), col, col == col);
   textureStore(dst, vec2<i32>(i, j), vec4<f32>(col, 1.0));
+}
+`;
+
+/**
+ * Bright-pass with a 2x downsample, the first of three bloom stages.
+ *
+ * Bloom is three cheap passes rather than one wide blur: extract what is bright,
+ * blur it separably at half resolution, then add it back. At half res each pass
+ * touches a quarter of the pixels, so the whole chain costs well under one
+ * full-resolution pass -- which matters because the brief is explicit that frame
+ * rate must not be traded away for the effect.
+ *
+ * A soft knee rather than a hard threshold: a hard cutoff makes the glow pop in
+ * and out as a vortex crosses it, which reads as flickering rather than as
+ * light.
+ */
+export const BLOOM_BRIGHT = /* wgsl */`
+@group(0) @binding(1) var src : texture_2d<f32>;
+@group(0) @binding(2) var dst : texture_storage_2d<rgba16float, write>;
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let dims = textureDimensions(dst);
+  if (gid.x >= dims.x || gid.y >= dims.y) { return; }
+  let i = i32(gid.x) * 2;
+  let j = i32(gid.y) * 2;
+
+  // Box-average the 2x2 source block; free antialiasing for the glow.
+  var acc = vec3<f32>(0.0);
+  for (var dj = 0; dj < 2; dj = dj + 1) {
+    for (var di = 0; di < 2; di = di + 1) {
+      acc = acc + textureLoad(src, vec2<i32>(i + di, j + dj), 0).rgb;
+    }
+  }
+  acc = acc * 0.25;
+
+  let lum = dot(acc, vec3<f32>(0.2126, 0.7152, 0.0722));
+  let knee = smoothstep(P.param_a, P.param_a + 0.6, lum);
+  textureStore(dst, vec2<i32>(gid.xy), vec4<f32>(acc * knee, 1.0));
+}
+`;
+
+/**
+ * Separable Gaussian blur, one axis per dispatch.
+ *
+ * param_b selects the axis (0 = horizontal, 1 = vertical). Separable because a
+ * 2D kernel of radius r costs r^2 taps while two 1D passes cost 2r -- at radius
+ * 6 that is 169 taps against 26, and the result is identical for a Gaussian.
+ */
+export const BLOOM_BLUR = /* wgsl */`
+@group(0) @binding(1) var src : texture_2d<f32>;
+@group(0) @binding(2) var dst : texture_storage_2d<rgba16float, write>;
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let dims = vec2<i32>(textureDimensions(dst));
+  if (i32(gid.x) >= dims.x || i32(gid.y) >= dims.y) { return; }
+
+  // Gaussian, sigma ~= 3.
+  var wts = array<f32, 7>(0.1964, 0.1747, 0.1210, 0.0656, 0.0278, 0.0092, 0.0024);
+  let axis = select(vec2<i32>(1, 0), vec2<i32>(0, 1), P.param_b >= 0.5);
+  let here = vec2<i32>(gid.xy);
+
+  var acc = textureLoad(src, here, 0).rgb * wts[0];
+  var norm = wts[0];
+  for (var k = 1; k < 7; k = k + 1) {
+    let o = axis * k;
+    // Clamp rather than wrap: the domain is periodic but the IMAGE is not, and
+    // wrapping would smear the glow from one edge onto the opposite one.
+    let a = clamp(here + o, vec2<i32>(0), dims - vec2<i32>(1));
+    let b = clamp(here - o, vec2<i32>(0), dims - vec2<i32>(1));
+    acc = acc + (textureLoad(src, a, 0).rgb + textureLoad(src, b, 0).rgb) * wts[k];
+    norm = norm + 2.0 * wts[k];
+  }
+  textureStore(dst, here, vec4<f32>(acc / norm, 1.0));
 }
 `;

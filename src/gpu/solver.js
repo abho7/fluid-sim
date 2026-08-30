@@ -34,6 +34,7 @@ import {
   COMMON, SAMPLING, ADVECT_VELOCITY, ADVECT_SCALAR, DIVERGENCE,
   JACOBI, RED_BLACK_GS, SUBTRACT_GRADIENT, DIFFUSE, VORTICITY_CONFINEMENT,
   SPLAT, RENDER, FORCING, ADVECT_FIELD_BY, MACCORMACK_COMBINE, SOLID_COUPLE,
+  BLOOM_BRIGHT, BLOOM_BLUR,
 } from "./shaders.js";
 import { Multigrid } from "./multigrid.js";
 
@@ -124,7 +125,22 @@ export class GPUFluidSolver {
     this.impulseTex = null; this.solidBuf = null; this.impulseRead = null;
     this.velIdx = 0; this.presIdx = 0; this.dyeIdx = 0;
 
-    this.output = this._tex("rgba8unorm");
+    // HDR, not rgba8unorm. The bloom chain thresholds on luminance, and
+    // thresholding an already tone-mapped 8-bit image finds a compressed version
+    // of the highlights -- the glow comes out grey. Keeping the render linear and
+    // letting values exceed 1.0 is what lets bright regions actually radiate.
+    // Tone mapping and gamma happen once, in the final blit.
+    this.output = this._tex("rgba16float");
+
+    // Bloom works at half resolution: a quarter of the pixels per pass, and the
+    // blur is wide enough that the lost detail is invisible.
+    this.bloomW = Math.max(1, this.nx >> 1);
+    this.bloomH = Math.max(1, this.ny >> 1);
+    const mkBloom = () => this.device.createTexture({
+      size: [this.bloomW, this.bloomH], format: "rgba16float",
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    this.bloom = [mkBloom(), mkBloom()];
 
     // A RING OF UNIFORM SLOTS, not a single uniform buffer.
     //
@@ -158,9 +174,24 @@ export class GPUFluidSolver {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
     this._slot = 0;
+    // A RING, for exactly the reason the params buffer is one.
+    //
+    // This buffer was left as a single slot when `params` was fixed, and it has
+    // the same defect: every splat pass in a command buffer read the LAST
+    // splat's uniform, including its `isDye` flag. With ambient emitters
+    // pushing a dye splat and then a velocity splat each frame, the frame always
+    // ended on a velocity splat -- so the dye passes ran the velocity branch and
+    // wrote `vec4(u, v, 0, 0)` into the DYE texture.
+    //
+    // It showed as green: those cells had red and green from the velocity
+    // components and blue EXACTLY zero, and no colour in the palette has blue
+    // exactly zero. 69% of lit dye cells were green-dominant.
+    this.splatSlots = 256;
     this.splatParams = d.createBuffer({
-      size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      size: this.uniformStride * this.splatSlots,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
+    this._splatSlot = 0;
     // Readback staging buffer, allocated once. Creating one per readback made
     // the diagnostics dominate the frame time they were trying to measure.
     this.readback = d.createBuffer({
@@ -202,6 +233,8 @@ export class GPUFluidSolver {
       advectFieldBy: this._pipeline(ADVECT_FIELD_BY),
       macCombine: this._pipeline(MACCORMACK_COMBINE),
       solidCouple: this._pipeline(SOLID_COUPLE),
+      bloomBright: this._pipeline(BLOOM_BRIGHT),
+      bloomBlur: this._pipeline(BLOOM_BLUR),
     };
   }
 
@@ -289,8 +322,23 @@ export class GPUFluidSolver {
     );
   }
 
-  /** Read a texture back to the CPU as a Float32Array of vec4s. */
+  /**
+   * Read a texture back to the CPU as a Float32Array of vec4s.
+   *
+   * Only valid for rgba32float. The bytes-per-row here is 16 per texel, and
+   * passing an rgba16float texture (such as `output`, since the render path
+   * went HDR) silently reinterprets half-floats as floats and returns numbers
+   * that look plausible and mean nothing -- it reported render values of 92
+   * where the shader cannot produce more than about 7. Guarded rather than
+   * generalised: nothing needs to read the half-float targets back, and a
+   * wrong answer is worse than a refusal.
+   */
   async readTexture(tex) {
+    if (tex.format !== "rgba32float") {
+      throw new Error(
+        `readTexture expects rgba32float, got ${tex.format}; ` +
+        "the 16-byte stride would misread it");
+    }
     const enc = this.device.createCommandEncoder();
     enc.copyTextureToBuffer(
       { texture: tex },
@@ -470,6 +518,7 @@ export class GPUFluidSolver {
   step(dt, { splats = [] } = {}) {
     const d = this.device;
     this._resetSlots();
+    this._splatSlot = 0;
     const enc = d.createCommandEncoder();
     let pass;
 
@@ -690,6 +739,7 @@ export class GPUFluidSolver {
 
   // ------------------------------------------------------------- interaction
 
+  /** Write one splat into a fresh slot; returns its byte offset. */
   _writeSplat(s) {
     const buf = new ArrayBuffer(48);
     const f = new Float32Array(buf);
@@ -698,34 +748,80 @@ export class GPUFluidSolver {
     f[4] = s.r || 0; f[5] = s.g || 0; f[6] = s.b || 0; f[7] = 0;
     f[8] = s.radius || 0.2;
     f[9] = s.isDye ? 1 : 0;
-    this.device.queue.writeBuffer(this.splatParams, 0, buf);
+    const offset = (this._splatSlot % this.splatSlots) * this.uniformStride;
+    this._splatSlot++;
+    this.device.queue.writeBuffer(this.splatParams, offset, buf);
+    return offset;
   }
 
-  _bindSplat(src, dst, dt) {
+  _bindSplat(src, dst, dt, splatOffset) {
     const offset = this._writeParams(dt);
     return this.device.createBindGroup({
       layout: this.pipe.splat.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: { buffer: this.params, offset, size: 32 } },
-        { binding: 1, resource: { buffer: this.splatParams } },
+        { binding: 1, resource: { buffer: this.splatParams, offset: splatOffset, size: 48 } },
         { binding: 2, resource: src.createView() },
         { binding: 3, resource: dst.createView() },
       ],
     });
   }
 
-  /** Render the current state into the output texture. */
-  render({ mode = 0, scale = 1.5 } = {}) {
+  /**
+   * Render the current state, then build a bloom texture from it.
+   *
+   * Display only: this reads the simulation fields and produces pixels, and
+   * nothing it computes is fed back into the solve.
+   *
+   * @param {number} bloomThreshold luminance above which a pixel glows
+   * @param {number} bloomPasses    blur iterations; 2 is a wider, softer glow
+   */
+  render({ mode = 0, scale = 1.5, bloomThreshold = 0.75, bloomPasses = 2 } = {}) {
     this._resetSlots();
     const enc = this.device.createCommandEncoder();
-    const pass = enc.beginComputePass();
+
+    let pass = enc.beginComputePass();
     this._dispatch(pass, this.pipe.render, this._bind(this.pipe.render,
       { dt: 0, paramA: scale, paramB: mode }, [
-      { binding: 1, resource: this.velCur.createView() },
-      { binding: 2, resource: this.dyeCur.createView() },
-      { binding: 3, resource: this.output.createView() },
-    ]));
+        { binding: 1, resource: this.velCur.createView() },
+        { binding: 2, resource: this.dyeCur.createView() },
+        { binding: 3, resource: this.output.createView() },
+      ]));
     pass.end();
+
+    if (bloomPasses > 0) {
+      // The bright pass reads the full-res render and writes the half-res
+      // bloom texture, so every dispatch here is sized to the BLOOM texture
+      // rather than the simulation grid.
+      const wg = (n) => Math.ceil(n / WG);
+
+      pass = enc.beginComputePass();
+      pass.setPipeline(this.pipe.bloomBright);
+      pass.setBindGroup(0, this._bind(this.pipe.bloomBright,
+        { dt: 0, paramA: bloomThreshold }, [
+          { binding: 1, resource: this.output.createView() },
+          { binding: 2, resource: this.bloom[0].createView() },
+        ]));
+      pass.dispatchWorkgroups(wg(this.bloomW), wg(this.bloomH));
+      pass.end();
+
+      for (let k = 0; k < bloomPasses; k++) {
+        for (const axis of [0, 1]) {
+          const src = this.bloom[0], dst = this.bloom[1];
+          pass = enc.beginComputePass();
+          pass.setPipeline(this.pipe.bloomBlur);
+          pass.setBindGroup(0, this._bind(this.pipe.bloomBlur,
+            { dt: 0, paramB: axis }, [
+              { binding: 1, resource: src.createView() },
+              { binding: 2, resource: dst.createView() },
+            ]));
+          pass.dispatchWorkgroups(wg(this.bloomW), wg(this.bloomH));
+          pass.end();
+          this.bloom.reverse();
+        }
+      }
+    }
+
     this.device.queue.submit([enc.finish()]);
     return this.output;
   }
@@ -805,6 +901,7 @@ export class GPUFluidSolver {
     this.mcFwd?.destroy(); this.mcBack?.destroy();
     this.impulseTex?.destroy(); this.solidBuf?.destroy();
     this.impulseRead?.destroy();
+    this.bloom?.forEach(t => t.destroy());
     for (const t of [...this.vel, ...this.pressure, ...this.dye, this.div, this.output]) {
       t.destroy();
     }
