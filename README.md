@@ -1,5 +1,8 @@
 # fluid-sim
 
+[![ci](https://github.com/abho7/fluid-sim/actions/workflows/pages.yml/badge.svg)](https://github.com/abho7/fluid-sim/actions/workflows/pages.yml)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 An incompressible Navier-Stokes solver running on WebGPU compute shaders, with
 the physics validated against closed-form solutions rather than against how it
 looks.
