@@ -1255,6 +1255,22 @@ const html = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Validating a Fluid Solver</title>
 <meta name="description" content="An incompressible Navier-Stokes solver on WebGPU, measured against analytic solutions: numerical viscosity, stability boundaries, convergence, and an energy spectrum that does not match theory.">
+<link rel="canonical" href="https://abho7.github.io/fluid-sim/report.html">
+<link rel="icon" href="favicon.ico" sizes="32x32">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://abho7.github.io/fluid-sim/report.html">
+<meta property="og:title" content="Validating a Fluid Solver">
+<meta property="og:description" content="An incompressible Navier-Stokes solver on WebGPU, measured against analytic solutions: numerical viscosity, stability boundaries, convergence, and an energy spectrum that does not match theory.">
+<meta property="og:image" content="https://abho7.github.io/fluid-sim/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="fluid-sim - numerical viscosity 5.79e-4, 2.9% of the physical value">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Validating a Fluid Solver">
+<meta name="twitter:description" content="An incompressible Navier-Stokes solver on WebGPU, measured against analytic solutions: numerical viscosity, stability boundaries, convergence, and an energy spectrum that does not match theory.">
+<meta name="twitter:image" content="https://abho7.github.io/fluid-sim/og.png">
 <style>${CSS}</style>
 </head>
 <body>
